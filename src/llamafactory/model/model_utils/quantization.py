@@ -94,11 +94,27 @@ def configure_quantization(
         quantization_config: dict[str, Any] = getattr(config, "quantization_config", None)
         quant_method = quantization_config.get("quant_method", "")
 
-        if quant_method not in (QuantizationMethod.MXFP4, QuantizationMethod.FP8) and (
-            is_deepspeed_zero3_enabled() or is_fsdp_enabled()
+        kt_backend = os.environ.get("ACCELERATE_KT_BACKEND", "")
+        kt_kgroup_path = (
+            getattr(model_args, "use_kt", False)
+            and getattr(model_args, "kt_weight_path", None)
+            and quant_method == "compressed-tensors"
+            and "KGroup" in kt_backend
+        )
+        if (
+            quant_method not in (QuantizationMethod.MXFP4, QuantizationMethod.FP8)
+            and (is_deepspeed_zero3_enabled() or is_fsdp_enabled())
+            and not kt_kgroup_path
         ):
             # mxfp4 will dequant the model weights
             raise ValueError("DeepSpeed ZeRO-3 or FSDP is incompatible with PTQ-quantized models.")
+        if kt_kgroup_path:
+            logger.info_rank0("Allowing compressed-tensors PTQ config under FSDP for KTransformers KGroup SFT.")
+            if getattr(model_args, "kt_text_only_sft", False) and getattr(config, "model_type", None) == "kimi_k25":
+                ignore = quantization_config.setdefault("ignore", [])
+                for pattern in ["re:.*vision_tower.*", "re:.*mm_projector.*"]:
+                    if pattern not in ignore:
+                        ignore.append(pattern)
 
         if quant_method == QuantizationMethod.MXFP4:
             from transformers import Mxfp4Config

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
@@ -46,6 +47,25 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _checkpoint_uses_text_layers_prefix(model_name_or_path: str | None) -> bool:
+    if model_name_or_path is None or not os.path.isdir(model_name_or_path):
+        return False
+
+    index_path = os.path.join(model_name_or_path, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return False
+
+    try:
+        with open(index_path, encoding="utf-8") as f:
+            weight_map = json.load(f).get("weight_map", {})
+    except Exception:
+        return False
+
+    has_text_layers = any(key.startswith("model.layers.") for key in weight_map)
+    has_vl_layers = any(key.startswith("model.language_model.layers.") for key in weight_map)
+    return has_text_layers and not has_vl_layers
 
 
 class TokenizerModule(TypedDict):
@@ -157,7 +177,20 @@ def load_model(
         if model_args.mixture_of_depths == "load":
             model = load_mod_pretrained_model(**init_kwargs)
         else:
-            if type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
+            force_text_only_qwen35 = (
+                model_args.use_kt
+                and getattr(config, "model_type", None) in ["qwen3_5", "qwen3_5_moe"]
+                and _checkpoint_uses_text_layers_prefix(model_args.model_name_or_path)
+            )
+            if force_text_only_qwen35 and hasattr(config, "text_config"):
+                config.text_config.architectures = ["Qwen3_5MoeForCausalLM"]
+                init_kwargs["config"] = config.text_config
+                load_class = AutoModelForCausalLM
+                logger.warning_rank0(
+                    "Detected Qwen3.5 config with text-only checkpoint keys. "
+                    "Loading with AutoModelForCausalLM and text_config for KT training."
+                )
+            elif type(config) in AutoModelForImageTextToText._model_mapping.keys():  # image-text
                 load_class = AutoModelForImageTextToText
             elif type(config) in AutoModelForSeq2SeqLM._model_mapping.keys():  # audio-text
                 load_class = AutoModelForSeq2SeqLM
@@ -199,12 +232,21 @@ def load_model(
     # Conv3D is not recommended when using torch 2.9.x
     if is_torch_version_greater_than("2.9.0") and not is_torch_version_greater_than("2.10.0"):
         if any(isinstance(m, torch.nn.Conv3d) for m in model.modules()):
-            raise ValueError(
-                "Unsupported torch version detected: torch 2.9.x with Conv3D. "
-                "This combination is known to cause severe performance regression. "
-                "Please downgrade torch to <2.9 or remove Conv3D. "
-                "See https://github.com/pytorch/pytorch/issues/166122"
-            )
+            if getattr(model_args, "use_kt", False) and getattr(model.config, "model_type", None) in [
+                "qwen3_5",
+                "qwen3_5_moe",
+            ]:
+                logger.warning_rank0(
+                    "Detected torch 2.9.x with Conv3D in Qwen3.5 vision modules. "
+                    "Continuing because KT text LoRA training does not exercise the vision tower."
+                )
+            else:
+                raise ValueError(
+                    "Unsupported torch version detected: torch 2.9.x with Conv3D. "
+                    "This combination is known to cause severe performance regression. "
+                    "Please downgrade torch to <2.9 or remove Conv3D. "
+                    "See https://github.com/pytorch/pytorch/issues/166122"
+                )
 
     if not is_trainable:
         model.requires_grad_(False)

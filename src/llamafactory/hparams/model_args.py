@@ -490,18 +490,43 @@ class KTransformersArguments:
         default=None,
         metadata={"help": "Intermediate size for GPU-side LoRA Experts."},
     )
+    kt_sync_after_wrap: bool | None = field(
+        default=None,
+        metadata={"help": "Whether to synchronize distributed ranks after KTransformers MoE wrapping."},
+    )
+    kt_text_only_sft: bool | None = field(
+        default=None,
+        metadata={"help": "Whether the KTransformers run is text-only SFT for multimodal checkpoints."},
+    )
+    kt_skip_expert_lora_adaptation: bool | None = field(
+        default=None,
+        metadata={"help": "Whether to skip KTransformers expert LoRA adaptation for nonexpert LoRA training."},
+    )
+    kt_force_fused_expert_lora: bool | None = field(
+        default=None,
+        metadata={"help": "Whether to force KT-managed fused expert LoRA buffers for MoE expert LoRA training."},
+    )
 
     def get_kt_config_dict(self, finetuning_args: Any, model_max_length: int | None) -> dict[str, Any]:
         r"""Build KT config values from LLaMA-Factory model and LoRA arguments."""
+        kt_model_max_length = model_max_length
+        env_kt_model_max_length = os.environ.get("ACCELERATE_KT_MODEL_MAX_LENGTH")
+        if env_kt_model_max_length:
+            kt_model_max_length = max(int(env_kt_model_max_length), kt_model_max_length or 0)
+
         kt_config = {
             "kt_lora_rank": getattr(finetuning_args, "lora_rank", None),
             "kt_lora_alpha": getattr(finetuning_args, "lora_alpha", None),
             "kt_weight_path": self.kt_weight_path,
             "kt_expert_checkpoint_path": self.kt_expert_checkpoint_path,
-            "kt_model_max_length": model_max_length,
+            "kt_model_max_length": kt_model_max_length,
             "kt_use_lora_experts": self.kt_use_lora_experts,
             "kt_lora_expert_num": self.kt_lora_expert_num,
             "kt_lora_expert_intermediate_size": self.kt_lora_expert_intermediate_size,
+            "kt_sync_after_wrap": self.kt_sync_after_wrap,
+            "kt_text_only_sft": self.kt_text_only_sft,
+            "kt_skip_expert_lora_adaptation": self.kt_skip_expert_lora_adaptation,
+            "kt_force_fused_expert_lora": self.kt_force_fused_expert_lora,
         }
         return {key: value for key, value in kt_config.items() if value is not None}
 
@@ -520,6 +545,10 @@ class KTransformersArguments:
             "kt_use_lora_experts": "ACCELERATE_KT_USE_LORA_EXPERTS",
             "kt_lora_expert_num": "ACCELERATE_KT_LORA_EXPERT_NUM",
             "kt_lora_expert_intermediate_size": "ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE",
+            "kt_sync_after_wrap": "ACCELERATE_KT_SYNC_AFTER_WRAP",
+            "kt_text_only_sft": "ACCELERATE_KT_TEXT_ONLY_SFT",
+            "kt_skip_expert_lora_adaptation": "ACCELERATE_KT_SKIP_EXPERT_LORA_ADAPTATION",
+            "kt_force_fused_expert_lora": "ACCELERATE_KT_FORCE_FUSED_EXPERT_LORA",
         }
         for key, env_key in env_mapping.items():
             value = kt_config.get(key)

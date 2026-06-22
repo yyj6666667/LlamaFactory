@@ -87,7 +87,7 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
 
     if getattr(config, "model_type", None) == "internlm2":  # special case for custom models
         setattr(config, "attn_implementation", requested_attn_implementation)
-    elif getattr(config, "model_type", None) == "kimi_vl":
+    elif getattr(config, "model_type", None) in ["kimi_k25", "kimi_vl"]:
         setattr(config.vision_config, "_attn_implementation", requested_attn_implementation)
         setattr(config.text_config, "_attn_implementation", requested_attn_implementation)
     elif getattr(config, "model_type", None) == "youtu_vl":
