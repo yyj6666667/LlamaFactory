@@ -17,6 +17,7 @@
 
 import json
 import os
+import time
 from functools import partial
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -24,7 +25,12 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import numpy as np
 import torch
 from transformers import Seq2SeqTrainer
+from transformers.training_args import OptimizerNames
+from transformers.utils import is_sagemaker_mp_enabled
 from typing_extensions import override
+
+from accelerate.utils import DistributedType
+from accelerate.utils.memory import clear_device_cache
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
@@ -126,6 +132,161 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         if training_args.fp8 and hasattr(self, "accelerator"):  # verify FP8 status after trainer initialization
             verify_fp8_status(self.accelerator, training_args)
+
+    def _kt_e2e_timing_enabled(self) -> bool:
+        return bool(os.environ.get("KT_E2E_TIMING_JSONL"))
+
+    def _kt_e2e_sync_time(self) -> float:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def _kt_e2e_reduce_max_ms(self, value_ms: float) -> float:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return value_ms
+
+        device = self.args.device if self.args.device.type != "cpu" else torch.device("cpu")
+        value = torch.tensor([value_ms], dtype=torch.float64, device=device)
+        torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MAX)
+        return float(value.item())
+
+    def _kt_e2e_reduce_sum_int(self, value: int) -> int:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return value
+
+        device = self.args.device if self.args.device.type != "cpu" else torch.device("cpu")
+        tensor = torch.tensor([value], dtype=torch.long, device=device)
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+        return int(tensor.item())
+
+    def _kt_e2e_reduce_max_int(self, value: int) -> int:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return value
+
+        device = self.args.device if self.args.device.type != "cpu" else torch.device("cpu")
+        tensor = torch.tensor([value], dtype=torch.long, device=device)
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+        return int(tensor.item())
+
+    def _kt_e2e_input_stats(self, inputs: dict[str, Union["torch.Tensor", Any]]) -> dict[str, Any]:
+        stats = {
+            "batch_size_local": 0,
+            "seq_len_local": 0,
+            "input_tokens_local": 0,
+            "attention_tokens_local": 0,
+            "label_tokens_local": 0,
+        }
+        input_ids = inputs.get("input_ids")
+        attention_mask = inputs.get("attention_mask")
+        labels = inputs.get("labels")
+
+        if isinstance(input_ids, torch.Tensor):
+            stats["input_shape"] = list(input_ids.shape)
+            if input_ids.ndim >= 1:
+                stats["batch_size_local"] = int(input_ids.shape[0])
+            if input_ids.ndim >= 2:
+                stats["seq_len_local"] = int(input_ids.shape[1])
+            stats["input_tokens_local"] = int(input_ids.numel())
+
+        if isinstance(attention_mask, torch.Tensor):
+            try:
+                stats["attention_tokens_local"] = int(attention_mask.detach().sum().item())
+            except Exception:
+                pass
+
+        if isinstance(labels, torch.Tensor):
+            try:
+                stats["label_tokens_local"] = int((labels.detach() != IGNORE_INDEX).sum().item())
+            except Exception:
+                pass
+
+        for key in ("input_tokens", "attention_tokens", "label_tokens"):
+            local_value = int(stats[f"{key}_local"])
+            stats[f"{key}_global"] = self._kt_e2e_reduce_sum_int(local_value)
+
+        for key in ("batch_size", "seq_len"):
+            local_value = int(stats[f"{key}_local"])
+            stats[f"{key}_max"] = self._kt_e2e_reduce_max_int(local_value)
+
+        return stats
+
+    def _kt_e2e_write_timing(self, record: dict[str, Any]) -> None:
+        if not self.is_world_process_zero():
+            return
+
+        path = os.environ.get("KT_E2E_TIMING_JSONL")
+        if not path:
+            return
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    @override
+    def training_step(
+        self,
+        model: "torch.nn.Module",
+        inputs: dict[str, Union["torch.Tensor", Any]],
+        num_items_in_batch: Optional[Union["torch.Tensor", int]] = None,
+    ) -> "torch.Tensor":
+        if not self._kt_e2e_timing_enabled() or is_sagemaker_mp_enabled():
+            return super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+
+        cp_context, inputs = self._prepare_context_parallel_inputs(model, inputs)
+
+        with cp_context():
+            model.train()
+            if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+                self.optimizer.train()
+
+            inputs = self._prepare_inputs(inputs)
+            input_stats = self._kt_e2e_input_stats(inputs)
+            forward_start = self._kt_e2e_sync_time()
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+            forward_ms_local = (self._kt_e2e_sync_time() - forward_start) * 1000.0
+
+            del inputs
+            if (
+                self.args.torch_empty_cache_steps is not None
+                and self.state.global_step % self.args.torch_empty_cache_steps == 0
+            ):
+                clear_device_cache()
+
+            kwargs = {}
+            if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+                kwargs["learning_rate"] = self._get_learning_rate()
+
+            if self.args.n_gpu > 1:
+                loss = loss.mean()
+
+            if (not self.model_accepts_loss_kwargs or num_items_in_batch is None) and self.compute_loss_func is None:
+                loss = loss / self.current_gradient_accumulation_steps
+
+            if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                kwargs["scale_wrt_gas"] = False
+
+            backward_start = self._kt_e2e_sync_time()
+            self.accelerator.backward(loss, **kwargs)
+            backward_ms_local = (self._kt_e2e_sync_time() - backward_start) * 1000.0
+
+            forward_ms = self._kt_e2e_reduce_max_ms(forward_ms_local)
+            backward_ms = self._kt_e2e_reduce_max_ms(backward_ms_local)
+            self._kt_e2e_write_timing(
+                {
+                    "record_type": "training_step_timing",
+                    "global_step_before": int(self.state.global_step),
+                    "sync_gradients": bool(getattr(self.accelerator, "sync_gradients", False)),
+                    "gradient_accumulation_steps": int(self.current_gradient_accumulation_steps),
+                    "forward_ms": forward_ms,
+                    "backward_ms": backward_ms,
+                    "backward_over_forward": backward_ms / forward_ms if forward_ms else None,
+                    "loss": float(loss.detach().float().item()),
+                    **input_stats,
+                }
+            )
+
+            return loss.detach()
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
