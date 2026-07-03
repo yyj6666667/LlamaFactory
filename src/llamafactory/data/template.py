@@ -1338,6 +1338,21 @@ register_template(
 
 
 register_template(
+    name="kimi_text_nothink",
+    format_user=StringFormatter(
+        slots=[
+            "<|im_user|>user<|im_middle|>{{content}}<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think></think>"
+        ]
+    ),
+    format_assistant=StringFormatter(slots=["{{content}}<|im_end|>"]),
+    format_system=StringFormatter(slots=["<|im_system|>system<|im_middle|>{{content}}<|im_end|>"]),
+    default_system="You are a helpful assistant",
+    stop_words=["<|im_end|>"],
+)
+
+
+register_template(
     name="lfm2",
     format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
     format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
