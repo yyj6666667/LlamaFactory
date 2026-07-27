@@ -53,6 +53,13 @@ _INFER_ARGS = [ModelArguments, DataArguments, FinetuningArguments, GeneratingArg
 _INFER_CLS = tuple[ModelArguments, DataArguments, FinetuningArguments, GeneratingArguments]
 _EVAL_ARGS = [ModelArguments, DataArguments, EvaluationArguments, FinetuningArguments]
 _EVAL_CLS = tuple[ModelArguments, DataArguments, EvaluationArguments, FinetuningArguments]
+_KT_LEGACY_ACTIVATION_ARGS = {
+    "disable_gradient_checkpointing",
+    "gradient_checkpointing",
+    "gradient_checkpointing_kwargs",
+    "use_reentrant_gc",
+    "use_unsloth_gc",
+}
 
 if is_mcore_adapter_available() and is_env_enabled("USE_MCA"):
     from mcore_adapter import TrainingArguments as McaTrainingArguments
@@ -81,6 +88,32 @@ def read_args(args: dict[str, Any] | list[str] | None = None) -> dict[str, Any] 
         return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config))
     else:
         return sys.argv[1:]
+
+
+def _get_explicit_arg_names(args: dict[str, Any] | list[str]) -> set[str]:
+    if isinstance(args, dict):
+        return set(args)
+
+    explicit_args = set()
+    for arg in args:
+        if arg.startswith("--"):
+            explicit_args.add(arg[2:].split("=", maxsplit=1)[0].replace("-", "_"))
+
+    return explicit_args
+
+
+def _validate_kt_activation_policy_source(model_args: "ModelArguments", explicit_args: set[str]) -> None:
+    if not model_args.use_kt:
+        if "activation_policy" in explicit_args:
+            raise ValueError("`activation_policy` is only valid when `use_kt: true`.")
+        return
+
+    conflicting_args = sorted(_KT_LEGACY_ACTIVATION_ARGS & explicit_args)
+    if conflicting_args:
+        raise ValueError(
+            "`activation_policy` is the only checkpointing configuration for KTransformers training. "
+            f"Remove the legacy arguments: {conflicting_args}."
+        )
 
 
 def _parse_args(
@@ -186,7 +219,6 @@ def _verify_model_args(
             raise ValueError("Quantized model only accepts a single adapter. Merge them first.")
 
 
-
 def _check_extra_dependencies(
     model_args: "ModelArguments",
     finetuning_args: "FinetuningArguments",
@@ -287,11 +319,15 @@ def get_ray_args(args: dict[str, Any] | list[str] | None = None) -> RayArguments
 
 
 def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS:
+    raw_args = read_args(args)
+    explicit_args = _get_explicit_arg_names(raw_args)
     if is_env_enabled("USE_MCA"):
-        model_args, data_args, training_args, finetuning_args, generating_args = _parse_train_mca_args(args)
+        model_args, data_args, training_args, finetuning_args, generating_args = _parse_train_mca_args(raw_args)
     else:
-        model_args, data_args, training_args, finetuning_args, generating_args = _parse_train_args(args)
+        model_args, data_args, training_args, finetuning_args, generating_args = _parse_train_args(raw_args)
         finetuning_args.use_mca = False
+
+    _validate_kt_activation_policy_source(model_args, explicit_args)
 
     # Setup logging
     if training_args.should_log:
@@ -470,7 +506,7 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
         training_args.resume_from_checkpoint is None
         and training_args.do_train
         and os.path.isdir(training_args.output_dir)
-        and not getattr(training_args, "overwrite_output_dir", False) # for mca training args and transformers >= 5.0
+        and not getattr(training_args, "overwrite_output_dir", False)  # for mca training args and transformers >= 5.0
         and can_resume_from_checkpoint
     ):
         last_checkpoint = get_last_checkpoint(training_args.output_dir)

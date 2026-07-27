@@ -31,6 +31,13 @@ from ..extras.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _get_kt_activation_checkpoint_context_fn() -> Any:
+    r"""Load the KT checkpoint context only for KT training that recomputes GPU activations."""
+    from kt_kernel.sft import get_activation_checkpoint_context_fn
+
+    return get_activation_checkpoint_context_fn()
+
+
 @dataclass
 class BaseModelArguments:
     r"""Arguments pertaining to the model."""
@@ -470,6 +477,15 @@ class KTransformersArguments:
         default=False,
         metadata={"help": "Whether to use KTransformers AMX MoE backend for SFT training."},
     )
+    activation_policy: dict[str, str] = field(
+        default_factory=lambda: {"cpu": "recompute", "gpu": "recompute"},
+        metadata={
+            "help": (
+                "KTransformers activation policy. Must contain exactly "
+                "{'cpu': 'retain|recompute', 'gpu': 'retain|recompute'}."
+            )
+        },
+    )
     kt_weight_path: str | None = field(
         default=None,
         metadata={"help": "Path to pre-quantized INT8 expert weights (.kt files)."},
@@ -506,6 +522,60 @@ class KTransformersArguments:
         default=None,
         metadata={"help": "Whether to force KT-managed fused expert LoRA buffers for MoE expert LoRA training."},
     )
+    kt_activation_checkpoint_context_fn: Any = field(
+        default=None,
+        init=False,
+        repr=False,
+        metadata={"help": "Internal KT checkpoint context function. Do not specify it."},
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.activation_policy, dict):
+            raise ValueError("`activation_policy` must be a mapping with exactly the `cpu` and `gpu` keys.")
+
+        expected_keys = {"cpu", "gpu"}
+        actual_keys = set(self.activation_policy)
+        if actual_keys != expected_keys:
+            missing = sorted(expected_keys - actual_keys)
+            unknown = sorted(actual_keys - expected_keys)
+            details = []
+            if missing:
+                details.append(f"missing keys: {missing}")
+            if unknown:
+                details.append(f"unknown keys: {unknown}")
+            raise ValueError(f"Invalid `activation_policy` ({'; '.join(details)}).")
+
+        policy = {key: self.activation_policy[key] for key in ("cpu", "gpu")}
+        for location, behavior in policy.items():
+            if behavior not in {"retain", "recompute"}:
+                raise ValueError(f"`activation_policy.{location}` must be `retain` or `recompute`, got {behavior!r}.")
+
+        if policy == {"cpu": "recompute", "gpu": "retain"}:
+            raise NotImplementedError(
+                "`activation_policy: {cpu: recompute, gpu: retain}` is not supported yet. "
+                "Use retain/retain, retain/recompute, or recompute/recompute."
+            )
+
+        self.activation_policy = policy
+
+    def apply_activation_policy(self, training_args: Any) -> None:
+        r"""Make the KT activation policy authoritative for both checkpointing entry points."""
+        gpu_policy = self.activation_policy["gpu"]
+        self.use_unsloth_gc = False
+        self.use_reentrant_gc = False
+
+        if gpu_policy == "recompute":
+            context_fn = _get_kt_activation_checkpoint_context_fn()
+            self.disable_gradient_checkpointing = False
+            self.kt_activation_checkpoint_context_fn = context_fn
+        else:
+            self.disable_gradient_checkpointing = True
+            self.kt_activation_checkpoint_context_fn = None
+
+        # LLaMA-Factory prepares the model before Trainer construction. Keep the
+        # Trainer path disabled so it cannot install a second checkpoint wrapper.
+        training_args.gradient_checkpointing = False
+        training_args.gradient_checkpointing_kwargs = None
 
     def get_kt_config_dict(self, finetuning_args: Any, model_max_length: int | None) -> dict[str, Any]:
         r"""Build KT config values from LLaMA-Factory model and LoRA arguments."""
@@ -527,6 +597,7 @@ class KTransformersArguments:
             "kt_text_only_sft": self.kt_text_only_sft,
             "kt_skip_expert_lora_adaptation": self.kt_skip_expert_lora_adaptation,
             "kt_force_fused_expert_lora": self.kt_force_fused_expert_lora,
+            "kt_activation_policy": dict(self.activation_policy),
         }
         return {key: value for key, value in kt_config.items() if value is not None}
 
@@ -535,6 +606,7 @@ class KTransformersArguments:
         if not self.use_kt:
             return
 
+        self.apply_activation_policy(training_args)
         kt_config = self.get_kt_config_dict(finetuning_args, model_max_length)
         env_mapping = {
             "kt_weight_path": "ACCELERATE_KT_WEIGHT_PATH",
@@ -560,11 +632,7 @@ class KTransformersArguments:
             return
 
         hf_kt._kt_config.update(kt_config)
-        gc_enabled = getattr(training_args, "gradient_checkpointing", False) or not getattr(
-            self, "disable_gradient_checkpointing", True
-        )
-        if gc_enabled:
-            hf_kt._kt_config.setdefault("kt_share_cache_pool", True)
+        logger.info(f"KT activation policy: cpu={self.activation_policy['cpu']}, gpu={self.activation_policy['gpu']}")
 
 
 @dataclass
@@ -609,6 +677,7 @@ class ModelArguments(
         ExportArguments.__post_init__(self)
         VllmArguments.__post_init__(self)
         SGLangArguments.__post_init__(self)
+        KTransformersArguments.__post_init__(self)
 
     @classmethod
     def copyfrom(cls, source: "Self", **kwargs) -> "Self":

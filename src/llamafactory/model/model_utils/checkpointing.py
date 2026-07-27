@@ -171,9 +171,11 @@ def prepare_model_for_training(model: "PreTrainedModel", model_args: "ModelArgum
                 _gradient_checkpointing_enable, use_unsloth_gc=model_args.use_unsloth_gc
             )
             model.gradient_checkpointing_enable = MethodType(gradient_checkpointing_enable, model)
-            model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": model_args.use_reentrant_gc}
-            )
+            gradient_checkpointing_kwargs = {"use_reentrant": model_args.use_reentrant_gc}
+            if model_args.kt_activation_checkpoint_context_fn is not None:
+                gradient_checkpointing_kwargs["context_fn"] = model_args.kt_activation_checkpoint_context_fn
+
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
             setattr(model.config, "use_cache", False)  # turn off when gradient checkpointing is enabled
             logger.info_rank0("Gradient checkpointing enabled.")
 
