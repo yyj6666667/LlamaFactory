@@ -58,6 +58,7 @@ def test_deepseek_int8_example_is_two_gpu_acceptance_config():
     assert config["pure_bf16"] is True
     assert (config["cutoff_len"], config["per_device_train_batch_size"]) == (1024, 1)
     assert (config["gradient_accumulation_steps"], config["max_steps"]) == (1, 3)
+    assert "model_max_length" not in config
 
 
 def test_int8_config_is_forwarded_from_single_yaml_entry(monkeypatch: pytest.MonkeyPatch):
