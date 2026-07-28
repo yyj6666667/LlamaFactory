@@ -35,6 +35,16 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _load_kt_adapter_with_manifest(model: "PreTrainedModel", adapter_path: str) -> None:
+    r"""Adapt fused expert LoRA, validate its manifest, then load the KT-owned tensors."""
+    from kt_kernel.sft import kt_adapt_peft_lora, load_kt_moe_from_adapter
+    from transformers.integrations.kt_artifacts import load_kt_adapter_artifacts
+
+    kt_adapt_peft_lora(model)
+    load_kt_adapter_artifacts(model, adapter_path, load_kt_moe_from_adapter)
+    model._kt_adapter_loaded = True
+
+
 def _get_kt_fused_expert_exclude_pattern(model: "PreTrainedModel") -> str:
     r"""Build a PEFT exclusion pattern for expert projections owned by KT fused LoRA."""
     expert_prefixes = []
@@ -322,11 +332,7 @@ def _setup_lora_tuning(
             param.data = param.data.to(torch.float32)
 
     if model_args.use_kt and adapter_to_resume is not None and not is_trainable:
-        from kt_kernel.sft import kt_adapt_peft_lora, load_kt_moe_from_adapter
-
-        kt_adapt_peft_lora(model)
-        load_kt_moe_from_adapter(model, adapter_to_resume)
-        model._kt_adapter_loaded = True
+        _load_kt_adapter_with_manifest(model, adapter_to_resume)
 
     return model
 

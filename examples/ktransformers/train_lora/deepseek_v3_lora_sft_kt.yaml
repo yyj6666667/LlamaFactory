@@ -1,6 +1,7 @@
 ### model
 model_name_or_path: /mnt/data/models/DeepSeek-V3.1
-trust_remote_code: true
+trust_remote_code: false
+flash_attn: sdpa
 
 ### method
 stage: sft
@@ -47,8 +48,10 @@ resume_from_checkpoint: null
 use_kt: true
 kt_expert_weight_format: int8
 kt_weight_path: /mnt/data/models/kt-int8-dsv31-20260728-int8
+kt_non_expert_weight_path: /mnt/data/models/kt-bf16-nonexpert-dsv31-20260728-v1
 kt_weight_lifecycle: persistent
-kt_backend: AMXINT8
+kt_backend: auto
+kt_num_threads: 64
 kt_tp_enabled: true
 kt_threadpool_count: 2
 kt_num_gpu_experts: 0

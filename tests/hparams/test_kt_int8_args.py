@@ -44,10 +44,14 @@ def test_deepseek_int8_example_is_two_gpu_acceptance_config():
     config = yaml.safe_load(example_path.read_text())
 
     assert config["model_name_or_path"] == "/mnt/data/models/DeepSeek-V3.1"
+    assert config["trust_remote_code"] is False
+    assert config["flash_attn"] == "sdpa"
     assert config["kt_expert_weight_format"] == "int8"
     assert config["kt_weight_path"] == "/mnt/data/models/kt-int8-dsv31-20260728-int8"
+    assert config["kt_non_expert_weight_path"] == "/mnt/data/models/kt-bf16-nonexpert-dsv31-20260728-v1"
     assert config["kt_weight_lifecycle"] == "persistent"
-    assert config["kt_backend"] == "AMXINT8"
+    assert config["kt_backend"] == "auto"
+    assert config["kt_num_threads"] == 64
     assert config["kt_tp_enabled"] is True
     assert config["kt_threadpool_count"] == 2
     assert config["kt_num_gpu_experts"] == 0
@@ -74,7 +78,9 @@ def test_int8_config_is_forwarded_from_single_yaml_entry(monkeypatch: pytest.Mon
         use_kt=True,
         kt_expert_weight_format="int8",
         kt_weight_path="/tmp/int8-weights",
+        kt_non_expert_weight_path="/tmp/nonexpert-weights",
         kt_weight_lifecycle="persistent",
+        kt_num_threads=64,
         activation_policy={"cpu": "retain", "gpu": "recompute"},
     )
     finetuning_args = _finetuning_args()
@@ -83,20 +89,25 @@ def test_int8_config_is_forwarded_from_single_yaml_entry(monkeypatch: pytest.Mon
         gradient_checkpointing=False,
         gradient_checkpointing_kwargs=None,
         hf_kt_config=SimpleNamespace(_kt_config={}),
+        accelerator_config=SimpleNamespace(kt_config=None),
     )
 
     model_args.apply_kt_config(finetuning_args, training_args, model_max_length=1024)
 
     assert training_args.hf_kt_config._kt_config["kt_expert_weight_format"] == "int8"
     assert training_args.hf_kt_config._kt_config["kt_weight_path"] == "/tmp/int8-weights"
+    assert training_args.hf_kt_config._kt_config["kt_non_expert_weight_path"] == "/tmp/nonexpert-weights"
     assert training_args.hf_kt_config._kt_config["kt_weight_lifecycle"] == "persistent"
-    assert training_args.hf_kt_config._kt_config["kt_backend"] == "AMXINT8"
+    assert training_args.hf_kt_config._kt_config["kt_backend"] == "auto"
+    assert training_args.hf_kt_config._kt_config["kt_num_threads"] == 64
     assert training_args.hf_kt_config._kt_config["kt_tp_enabled"] is True
     assert training_args.hf_kt_config._kt_config["kt_threadpool_count"] == 2
     assert training_args.hf_kt_config._kt_config["kt_num_gpu_experts"] == 0
     assert training_args.hf_kt_config._kt_config["kt_share_backward_bb"] is True
     assert training_args.hf_kt_config._kt_config["kt_force_fused_expert_lora"] is True
-    assert model_args_module.os.environ["ACCELERATE_KT_BACKEND"] == "AMXINT8"
+    assert model_args_module.os.environ["ACCELERATE_KT_BACKEND"] == "auto"
+    assert model_args_module.os.environ["ACCELERATE_KT_NUM_THREADS"] == "64"
+    assert model_args_module.os.environ["ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH"] == "/tmp/nonexpert-weights"
     assert model_args_module.os.environ["ACCELERATE_KT_TP_ENABLED"] == "True"
     assert model_args_module.os.environ["ACCELERATE_KT_THREADPOOL_COUNT"] == "2"
     assert model_args_module.os.environ["ACCELERATE_KT_NUM_GPU_EXPERTS"] == "0"
@@ -106,9 +117,38 @@ def test_int8_config_is_forwarded_from_single_yaml_entry(monkeypatch: pytest.Mon
         "cpu": "retain",
         "gpu": "recompute",
     }
+    assert training_args.accelerator_config.kt_config["enabled"] is True
+    plugin_kt_config = training_args.accelerator_config.kt_config["kt_config"]
+    assert plugin_kt_config["kt_weight_path"] == "/tmp/int8-weights"
+    assert plugin_kt_config["kt_backend"] == "auto"
+    assert "enabled" not in plugin_kt_config
+    assert "kt_non_expert_weight_path" not in plugin_kt_config
     assert model_args.kt_activation_checkpoint_context_fn is checkpoint_context
     assert training_args.gradient_checkpointing is False
     assert training_args.gradient_checkpointing_kwargs is None
+
+
+def test_int8_inference_publishes_the_same_authoritative_config(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(model_args_module.os, "environ", {})
+    model_args = ModelArguments(
+        model_name_or_path="dummy",
+        use_kt=True,
+        kt_expert_weight_format="int8",
+        kt_weight_path="/tmp/int8-weights",
+        kt_non_expert_weight_path="/tmp/nonexpert-weights",
+        activation_policy={"cpu": "retain", "gpu": "recompute"},
+    )
+
+    model_args.apply_kt_inference_config(_finetuning_args(), model_max_length=1024)
+
+    assert model_args.kt_hf_config is not None
+    assert model_args.kt_hf_config._kt_config["kt_weight_path"] == "/tmp/int8-weights"
+    assert model_args.kt_hf_config._kt_config["kt_non_expert_weight_path"] == "/tmp/nonexpert-weights"
+    assert model_args.kt_hf_config._kt_config["kt_skip_expert_loading"] is True
+    assert model_args.kt_hf_config._kt_config["kt_model_max_length"] == 1024
+    assert model_args.disable_gradient_checkpointing is True
+    assert model_args.kt_activation_checkpoint_context_fn is None
+    assert model_args_module.os.environ["ACCELERATE_USE_KT"] == "true"
 
 
 @pytest.mark.parametrize(
@@ -122,12 +162,13 @@ def test_int8_config_is_forwarded_from_single_yaml_entry(monkeypatch: pytest.Mon
         ("kt_force_fused_expert_lora", False),
     ],
 )
-def test_int8_rejects_conflicting_accelerate_runtime(name: str, value):
+def test_int8_rejects_duplicate_accelerate_runtime(name: str, value):
     model_args = ModelArguments(
         model_name_or_path="dummy",
         use_kt=True,
         kt_expert_weight_format="int8",
         kt_weight_path="/tmp/int8-weights",
+        kt_non_expert_weight_path="/tmp/nonexpert-weights",
         activation_policy={"cpu": "retain", "gpu": "recompute"},
     )
     training_args = SimpleNamespace(
@@ -137,7 +178,7 @@ def test_int8_rejects_conflicting_accelerate_runtime(name: str, value):
         hf_kt_config=SimpleNamespace(_kt_config={name: value}),
     )
 
-    with pytest.raises(ValueError, match=f"Accelerate `{name}"):
+    with pytest.raises(ValueError, match="only KT configuration source"):
         model_args.apply_kt_config(_finetuning_args(), training_args, model_max_length=1024)
 
 
@@ -147,6 +188,7 @@ def test_int8_requires_bf16_training():
         use_kt=True,
         kt_expert_weight_format="int8",
         kt_weight_path="/tmp/int8-weights",
+        kt_non_expert_weight_path="/tmp/nonexpert-weights",
         activation_policy={"cpu": "retain", "gpu": "recompute"},
     )
     training_args = SimpleNamespace(
@@ -164,6 +206,7 @@ def test_int8_requires_bf16_training():
     ("model_kwargs", "finetuning_kwargs", "match"),
     [
         ({"kt_weight_path": None}, {}, "requires `kt_weight_path`"),
+        ({"kt_non_expert_weight_path": None}, {}, "requires `kt_non_expert_weight_path`"),
         (
             {"kt_expert_checkpoint_path": "/tmp/checkpoint"},
             {},
@@ -173,7 +216,8 @@ def test_int8_requires_bf16_training():
         ({}, {"finetuning_type": "full"}, "frozen-base"),
         ({"kt_weight_lifecycle": "ephemeral"}, {}, "requires `kt_weight_lifecycle: persistent`"),
         ({"activation_policy": {"cpu": "recompute", "gpu": "recompute"}}, {}, "requires `activation_policy"),
-        ({"kt_backend": "AMXBF16"}, {}, "requires `kt_backend: amxint8`"),
+        ({"kt_backend": "AMXBF16"}, {}, "requires `kt_backend: auto`"),
+        ({"trust_remote_code": True}, {}, "native Transformers implementation"),
         ({"kt_tp_enabled": False}, {}, "requires `kt_tp_enabled: true`"),
         ({"kt_threadpool_count": 1}, {}, "requires `kt_threadpool_count: 2`"),
         ({"kt_num_gpu_experts": 1}, {}, "requires `kt_num_gpu_experts: 0`"),
@@ -198,6 +242,7 @@ def test_int8_contract_fails_fast(model_kwargs: dict, finetuning_kwargs: dict, m
         "use_kt": True,
         "kt_expert_weight_format": "int8",
         "kt_weight_path": "/tmp/int8-weights",
+        "kt_non_expert_weight_path": "/tmp/nonexpert-weights",
         "activation_policy": {"cpu": "retain", "gpu": "recompute"},
     }
     kwargs.update(model_kwargs)
@@ -219,12 +264,24 @@ def test_ephemeral_lifecycle_requires_explicit_weight_format():
         model_args.validate_kt_finetuning(_finetuning_args())
 
 
+def test_num_threads_must_be_positive():
+    with pytest.raises(ValueError, match="`kt_num_threads` must be a positive integer"):
+        ModelArguments(model_name_or_path="dummy", use_kt=True, kt_num_threads=0)
+
+
+def test_legacy_kt_config_mapping_is_rejected():
+    model_args = ModelArguments(model_name_or_path="dummy", use_kt=True)
+    with pytest.raises(ValueError, match="only KT configuration source"):
+        _validate_kt_activation_policy_source(model_args, {"kt_config"})
+
+
 def test_int8_lifecycle_must_be_persistent():
     model_args = ModelArguments(
         model_name_or_path="dummy",
         use_kt=True,
         kt_expert_weight_format="int8",
         kt_weight_path="/tmp/weights",
+        kt_non_expert_weight_path="/tmp/nonexpert-weights",
         kt_weight_lifecycle="ephemeral",
         activation_policy={"cpu": "retain", "gpu": "recompute"},
     )
@@ -239,7 +296,9 @@ def test_int8_lifecycle_must_be_persistent():
         "kt_backend",
         "kt_expert_weight_format",
         "kt_force_fused_expert_lora",
+        "kt_non_expert_weight_path",
         "kt_num_gpu_experts",
+        "kt_num_threads",
         "kt_share_backward_bb",
         "kt_threadpool_count",
         "kt_tp_enabled",

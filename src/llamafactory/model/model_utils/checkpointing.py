@@ -40,6 +40,112 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def validate_kt_deepseek_v3_native_config(config: Any, model_args: "ModelArguments") -> None:
+    r"""Validate the production model-code contract before loading DeepSeek-V3 INT8 weights."""
+    if not model_args.use_kt or model_args.kt_expert_weight_format != "int8":
+        return
+
+    if model_args.trust_remote_code:
+        raise RuntimeError(
+            "KTransformers DeepSeek-V3 INT8 LoRA must use the native Transformers implementation "
+            "with `trust_remote_code: false`."
+        )
+
+    config_type = type(config)
+    if (
+        getattr(config, "model_type", None) != "deepseek_v3"
+        or config_type.__name__ != "DeepseekV3Config"
+        or not config_type.__module__.startswith("transformers.models.deepseek_v3.")
+    ):
+        raise RuntimeError(
+            "KTransformers INT8 LoRA currently requires the native "
+            "`transformers.models.deepseek_v3.DeepseekV3Config`; "
+            f"got {config_type.__module__}.{config_type.__name__}."
+        )
+
+    expected = {
+        "num_hidden_layers": 61,
+        "first_k_dense_replace": 3,
+        "n_routed_experts": 256,
+    }
+    mismatches = {
+        name: (getattr(config, name, None), value)
+        for name, value in expected.items()
+        if getattr(config, name, None) != value
+    }
+    if mismatches:
+        raise RuntimeError(f"DeepSeek-V3.1 INT8 model structure does not match the production contract: {mismatches}.")
+
+
+def _validate_kt_deepseek_v3_checkpointing(model: "PreTrainedModel", model_args: "ModelArguments") -> None:
+    if not model_args.use_kt or model_args.kt_expert_weight_format != "int8":
+        return
+
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise RuntimeError(
+            "KTransformers DeepSeek-V3 INT8 LoRA requires a Transformers build with `GradientCheckpointingLayer`."
+        ) from exc
+
+    model_type = type(model)
+    if not model_type.__module__.startswith("transformers.models.deepseek_v3."):
+        raise RuntimeError(
+            f"DeepSeek-V3 INT8 loaded non-native model code: {model_type.__module__}.{model_type.__name__}."
+        )
+
+    base_model = getattr(model, "model", None)
+    layers = getattr(base_model, "layers", None)
+    if not isinstance(layers, torch.nn.ModuleList) or len(layers) != 61:
+        raise RuntimeError("DeepSeek-V3.1 INT8 requires exactly 61 native decoder layers.")
+
+    invalid_layer_types = [
+        index for index, layer in enumerate(layers) if not isinstance(layer, GradientCheckpointingLayer)
+    ]
+    if invalid_layer_types:
+        raise RuntimeError(
+            "Every DeepSeek-V3.1 decoder layer must inherit `GradientCheckpointingLayer`; "
+            f"invalid layers: {invalid_layer_types}."
+        )
+
+    disabled_layers = [index for index, layer in enumerate(layers) if not layer.gradient_checkpointing]
+    if disabled_layers:
+        raise RuntimeError(f"Gradient checkpointing is disabled on decoder layers: {disabled_layers}.")
+
+    expected_context_fn = model_args.kt_activation_checkpoint_context_fn
+    invalid_checkpoint_functions = []
+    for index, layer in enumerate(layers):
+        checkpoint_func = getattr(layer, "_gradient_checkpointing_func", None)
+        checkpoint_contract = getattr(checkpoint_func, "_llamafactory_checkpoint_contract", None)
+        if (
+            not isinstance(checkpoint_contract, dict)
+            or checkpoint_contract.get("use_reentrant") is not False
+            or checkpoint_contract.get("context_fn") is not expected_context_fn
+        ):
+            invalid_checkpoint_functions.append(index)
+
+    if invalid_checkpoint_functions:
+        raise RuntimeError(
+            "DeepSeek-V3.1 INT8 requires non-reentrant checkpointing with the exact KT context_fn; "
+            f"invalid layers: {invalid_checkpoint_functions}."
+        )
+
+    if getattr(model.config, "use_cache", None) is not False:
+        raise RuntimeError("DeepSeek-V3.1 INT8 checkpointing requires `model.config.use_cache = false`.")
+
+    kt_wrappers = [module for module in model.modules() if getattr(module, "_is_kt_moe_wrapper", False)]
+    wrapper_layers = [getattr(wrapper, "layer_idx", None) for wrapper in kt_wrappers]
+    if not all(isinstance(layer_idx, int) for layer_idx in wrapper_layers):
+        raise RuntimeError("Every DeepSeek-V3.1 KT MoE wrapper must declare an integer `layer_idx`.")
+
+    wrapper_layers.sort()
+    if wrapper_layers != list(range(3, 61)):
+        raise RuntimeError(
+            "DeepSeek-V3.1 INT8 requires one KT MoE wrapper on every routed layer 3..60; "
+            f"got layer indices {wrapper_layers}."
+        )
+
+
 def get_unsloth_gradient_checkpointing_func() -> Callable:
     class UnslothGradientCheckpointing(torch.autograd.Function):
         r"""Saves VRAM by smartly offloading to RAM."""
@@ -126,6 +232,10 @@ def _gradient_checkpointing_enable(
         gradient_checkpointing_func = partial(checkpoint, **gradient_checkpointing_kwargs)
 
     gradient_checkpointing_func = get_custom_gradient_checkpointing_func(gradient_checkpointing_func)
+    gradient_checkpointing_func._llamafactory_checkpoint_contract = {
+        "use_reentrant": gradient_checkpointing_kwargs.get("use_reentrant", True),
+        "context_fn": gradient_checkpointing_kwargs.get("context_fn"),
+    }
     if "value" in inspect.signature(self._set_gradient_checkpointing).parameters:  # old GC format
         self.apply(partial(self._set_gradient_checkpointing, value=True))
         self.enable_input_require_grads()
@@ -177,6 +287,7 @@ def prepare_model_for_training(model: "PreTrainedModel", model_args: "ModelArgum
 
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
             setattr(model.config, "use_cache", False)  # turn off when gradient checkpointing is enabled
+            _validate_kt_deepseek_v3_checkpointing(model, model_args)
             logger.info_rank0("Gradient checkpointing enabled.")
 
     if model_args.upcast_lmhead_output:

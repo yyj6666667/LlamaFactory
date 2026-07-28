@@ -468,7 +468,7 @@ class SGLangArguments:
 
 @dataclass
 class KTransformersArguments:
-    r"""Arguments pertaining to KTransformers AMX MoE SFT training.
+    r"""Arguments pertaining to KTransformers CPU MoE SFT training.
 
     These fields are normalized into the transformers/accelerate KT config before training starts.
     """
@@ -490,6 +490,15 @@ class KTransformersArguments:
         default=None,
         metadata={"help": "Path to pre-quantized INT8 expert weights (.kt files)."},
     )
+    kt_non_expert_weight_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional path to a prepared non-expert weight cache. The directory must contain "
+                "`kt_non_expert_manifest.json` and a safetensors index."
+            )
+        },
+    )
     kt_expert_weight_format: Literal["int8"] | None = field(
         default=None,
         metadata={
@@ -510,7 +519,16 @@ class KTransformersArguments:
     )
     kt_backend: str | None = field(
         default=None,
-        metadata={"help": "KTransformers CPU expert backend. INT8 LoRA requires `AMXINT8`."},
+        metadata={
+            "help": (
+                "KTransformers CPU expert backend. Use `auto` for production INT8 LoRA so KT selects "
+                "the best supported INT8 kernel; `AMXINT8` remains a compatibility alias."
+            )
+        },
+    )
+    kt_num_threads: int | None = field(
+        default=None,
+        metadata={"help": "Total number of physical CPU threads assigned to KTransformers expert execution."},
     )
     kt_tp_enabled: bool | None = field(
         default=None,
@@ -566,6 +584,12 @@ class KTransformersArguments:
         repr=False,
         metadata={"help": "Internal KT checkpoint context function. Do not specify it."},
     )
+    kt_hf_config: Any = field(
+        default=None,
+        init=False,
+        repr=False,
+        metadata={"help": "Internal strong reference for the Transformers KT runtime config."},
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.activation_policy, dict):
@@ -604,6 +628,15 @@ class KTransformersArguments:
                 f"`kt_weight_lifecycle` must be `persistent` or `ephemeral`, got {self.kt_weight_lifecycle!r}."
             )
 
+        if isinstance(self.kt_backend, str):
+            if self.kt_backend.lower() == "auto":
+                self.kt_backend = "auto"
+            elif self.kt_backend.upper() == "AMXINT8":
+                self.kt_backend = "AMXINT8"
+
+        if self.kt_num_threads is not None and self.kt_num_threads <= 0:
+            raise ValueError("`kt_num_threads` must be a positive integer.")
+
     def validate_kt_finetuning(self, finetuning_args: Any) -> None:
         r"""Validate the LLaMA-Factory-facing contract for pre-quantized KT LoRA training."""
         if not self.use_kt:
@@ -619,7 +652,6 @@ class KTransformersArguments:
             return
 
         fixed_runtime = {
-            "kt_backend": "AMXINT8",
             "kt_tp_enabled": True,
             "kt_threadpool_count": 2,
             "kt_num_gpu_experts": 0,
@@ -633,6 +665,17 @@ class KTransformersArguments:
             elif value != expected:
                 raise ValueError(f"KTransformers INT8 LoRA requires `{name}: {str(expected).lower()}`.")
 
+        if self.kt_backend is None:
+            self.kt_backend = "auto"
+        elif self.kt_backend not in {"auto", "AMXINT8"}:
+            raise ValueError("KTransformers INT8 LoRA requires `kt_backend: auto` (`AMXINT8` is a legacy alias).")
+
+        if self.trust_remote_code:
+            raise ValueError(
+                "KTransformers DeepSeek-V3 INT8 LoRA requires the native Transformers implementation; "
+                "set `trust_remote_code: false`."
+            )
+
         if getattr(finetuning_args, "stage", None) != "sft":
             raise ValueError("KTransformers INT8 training currently supports only `stage: sft`.")
 
@@ -643,6 +686,12 @@ class KTransformersArguments:
 
         if not self.kt_weight_path:
             raise ValueError("`kt_expert_weight_format: int8` requires `kt_weight_path`.")
+
+        if not self.kt_non_expert_weight_path:
+            raise ValueError(
+                "KTransformers DeepSeek-V3 INT8 LoRA requires `kt_non_expert_weight_path` "
+                "pointing to a prepared, validated cache."
+            )
 
         if self.kt_weight_lifecycle != "persistent":
             raise ValueError("KTransformers INT8 LoRA requires `kt_weight_lifecycle: persistent`.")
@@ -719,9 +768,11 @@ class KTransformersArguments:
             "kt_lora_rank": getattr(finetuning_args, "lora_rank", None),
             "kt_lora_alpha": getattr(finetuning_args, "lora_alpha", None),
             "kt_weight_path": self.kt_weight_path,
+            "kt_non_expert_weight_path": self.kt_non_expert_weight_path,
             "kt_expert_weight_format": self.kt_expert_weight_format,
             "kt_weight_lifecycle": self.kt_weight_lifecycle,
             "kt_backend": self.kt_backend,
+            "kt_num_threads": self.kt_num_threads,
             "kt_tp_enabled": self.kt_tp_enabled,
             "kt_threadpool_count": self.kt_threadpool_count,
             "kt_num_gpu_experts": self.kt_num_gpu_experts,
@@ -739,41 +790,21 @@ class KTransformersArguments:
         }
         return {key: value for key, value in kt_config.items() if value is not None}
 
-    def apply_kt_config(self, finetuning_args: Any, training_args: Any, model_max_length: int | None) -> None:
-        r"""Apply LLaMA-Factory KT args to transformers/accelerate KT integration points."""
-        if not self.use_kt:
-            return
-
-        self.validate_kt_finetuning(finetuning_args)
-        if self.kt_expert_weight_format == "int8" and not getattr(training_args, "bf16", False):
-            raise ValueError("KTransformers INT8 LoRA requires `bf16: true` for LoRA, activations, and gradients.")
-
-        hf_kt = getattr(training_args, "hf_kt_config", None)
-        existing_kt_config = getattr(hf_kt, "_kt_config", None)
-        if self.kt_expert_weight_format == "int8" and isinstance(existing_kt_config, dict):
-            for name in (
-                "kt_backend",
-                "kt_tp_enabled",
-                "kt_threadpool_count",
-                "kt_num_gpu_experts",
-                "kt_share_backward_bb",
-                "kt_force_fused_expert_lora",
-            ):
-                existing = existing_kt_config.get(name)
-                expected = getattr(self, name)
-                if existing is not None and existing != expected:
-                    raise ValueError(
-                        f"Accelerate `{name}: {str(existing).lower()}` conflicts with the required "
-                        f"KTransformers INT8 LoRA setting `{name}: {str(expected).lower()}`."
-                    )
-
-        self.apply_activation_policy(training_args)
+    def _publish_kt_hf_config(
+        self,
+        finetuning_args: Any,
+        model_max_length: int | None,
+        existing_hf_config: Any = None,
+    ) -> tuple[Any, dict[str, Any]]:
         kt_config = self.get_kt_config_dict(finetuning_args, model_max_length)
+        hf_kt_config = {**kt_config, "enabled": True, "kt_skip_expert_loading": True}
         env_mapping = {
             "kt_weight_path": "ACCELERATE_KT_WEIGHT_PATH",
+            "kt_non_expert_weight_path": "ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH",
             "kt_expert_weight_format": "ACCELERATE_KT_EXPERT_WEIGHT_FORMAT",
             "kt_weight_lifecycle": "ACCELERATE_KT_WEIGHT_LIFECYCLE",
             "kt_backend": "ACCELERATE_KT_BACKEND",
+            "kt_num_threads": "ACCELERATE_KT_NUM_THREADS",
             "kt_tp_enabled": "ACCELERATE_KT_TP_ENABLED",
             "kt_threadpool_count": "ACCELERATE_KT_THREADPOOL_COUNT",
             "kt_num_gpu_experts": "ACCELERATE_KT_NUM_GPU_EXPERTS",
@@ -795,10 +826,95 @@ class KTransformersArguments:
             if value is not None:
                 os.environ[env_key] = str(value)
 
+        os.environ["ACCELERATE_USE_KT"] = "true"
+        hf_kt = existing_hf_config
         if hf_kt is None or not hasattr(hf_kt, "_kt_config") or not isinstance(hf_kt._kt_config, dict):
+            try:
+                from transformers.integrations.kt import HfTrainerKTConfig
+            except (ImportError, ModuleNotFoundError) as exc:
+                raise RuntimeError(
+                    "The installed Transformers build does not provide the KTransformers integration."
+                ) from exc
+
+            hf_kt = HfTrainerKTConfig(hf_kt_config)
+        else:
+            hf_kt._kt_config.update(hf_kt_config)
+
+        hf_kt._llamafactory_authoritative = True
+        self.kt_hf_config = hf_kt
+        return hf_kt, kt_config
+
+    def apply_kt_inference_config(self, finetuning_args: Any, model_max_length: int | None) -> None:
+        r"""Publish the same KT checkpoint/artifact contract before inference model loading."""
+        if not self.use_kt:
             return
 
-        hf_kt._kt_config.update(kt_config)
+        self.validate_kt_finetuning(finetuning_args)
+        self.disable_gradient_checkpointing = True
+        self.kt_activation_checkpoint_context_fn = None
+        self._publish_kt_hf_config(
+            finetuning_args,
+            model_max_length,
+            existing_hf_config=self.kt_hf_config,
+        )
+
+    def apply_kt_config(self, finetuning_args: Any, training_args: Any, model_max_length: int | None) -> None:
+        r"""Apply LLaMA-Factory KT args to transformers/accelerate KT integration points."""
+        if not self.use_kt:
+            return
+
+        self.validate_kt_finetuning(finetuning_args)
+        if self.kt_expert_weight_format == "int8" and not getattr(training_args, "bf16", False):
+            raise ValueError("KTransformers INT8 LoRA requires `bf16: true` for LoRA, activations, and gradients.")
+
+        hf_kt = getattr(training_args, "hf_kt_config", None)
+        existing_kt_config = getattr(hf_kt, "_kt_config", None)
+        accelerator_config = getattr(training_args, "accelerator_config", None)
+        if isinstance(accelerator_config, dict):
+            accelerate_kt_config = accelerator_config.get("kt_config")
+        else:
+            accelerate_kt_config = getattr(accelerator_config, "kt_config", None)
+
+        explicit_trainer_kt_config = getattr(training_args, "kt_config", None)
+        duplicate_sources = []
+        if explicit_trainer_kt_config:
+            duplicate_sources.append("TrainingArguments.kt_config")
+        if accelerate_kt_config:
+            duplicate_sources.append("accelerator_config.kt_config")
+        if isinstance(existing_kt_config, dict) and existing_kt_config:
+            duplicate_sources.append("pre-existing Transformers KT config")
+        if duplicate_sources and not getattr(hf_kt, "_llamafactory_authoritative", False):
+            raise ValueError(
+                "LLaMA-Factory model arguments are the only KT configuration source. Remove duplicate KT "
+                f"configuration from: {sorted(set(duplicate_sources))}."
+            )
+
+        self.apply_activation_policy(training_args)
+        hf_kt, kt_config = self._publish_kt_hf_config(
+            finetuning_args,
+            model_max_length,
+            existing_hf_config=hf_kt,
+        )
+        training_args.hf_kt_config = hf_kt
+        kt_kernel_config = {
+            key: value
+            for key, value in kt_config.items()
+            if key
+            not in {
+                "kt_non_expert_weight_path",
+                "kt_sync_after_wrap",
+                "kt_text_only_sft",
+                "kt_skip_expert_lora_adaptation",
+            }
+        }
+        accelerate_plugin_config = {
+            "enabled": True,
+            "kt_config": kt_kernel_config,
+        }
+        if isinstance(accelerator_config, dict):
+            accelerator_config["kt_config"] = accelerate_plugin_config
+        elif accelerator_config is not None:
+            setattr(accelerator_config, "kt_config", accelerate_plugin_config)
         logger.info(f"KT activation policy: cpu={self.activation_policy['cpu']}, gpu={self.activation_policy['gpu']}")
 
 

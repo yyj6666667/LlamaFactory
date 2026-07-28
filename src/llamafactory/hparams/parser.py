@@ -65,7 +65,9 @@ _KT_ONLY_ARGS = {
     "kt_backend",
     "kt_expert_weight_format",
     "kt_force_fused_expert_lora",
+    "kt_non_expert_weight_path",
     "kt_num_gpu_experts",
+    "kt_num_threads",
     "kt_share_backward_bb",
     "kt_threadpool_count",
     "kt_tp_enabled",
@@ -129,6 +131,12 @@ def _validate_kt_activation_policy_source(model_args: "ModelArguments", explicit
         raise ValueError(
             "`activation_policy` is the only checkpointing configuration for KTransformers training. "
             f"Remove the legacy arguments: {conflicting_args}."
+        )
+
+    if "kt_config" in explicit_args:
+        raise ValueError(
+            "LLaMA-Factory model arguments are the only KT configuration source. "
+            "Remove the duplicate `kt_config` mapping."
         )
 
 
@@ -243,9 +251,14 @@ def _check_extra_dependencies(
     training_args: Optional["TrainingArguments"] = None,
 ) -> None:
     if model_args.use_kt:
-        check_version("kt-kernel", mandatory=True)
-        check_version("transformers-kt", mandatory=True)
-        check_version("accelerate-kt", mandatory=True)
+        if model_args.kt_expert_weight_format == "int8":
+            check_version("kt-kernel==0.6.3.post1", mandatory=True)
+            check_version("transformers-kt==5.6.0.post1", mandatory=True)
+            check_version("accelerate-kt==1.14.0.post1", mandatory=True)
+        else:
+            check_version("kt-kernel", mandatory=True)
+            check_version("transformers-kt", mandatory=True)
+            check_version("accelerate-kt", mandatory=True)
 
     if model_args.use_unsloth:
         check_version("unsloth", mandatory=True)
@@ -605,6 +618,10 @@ def get_infer_args(args: dict[str, Any] | list[str] | None = None) -> _INFER_CLS
     else:
         model_args.device_map = "auto"
 
+    if model_args.use_kt:
+        model_args.model_max_length = data_args.cutoff_len
+        model_args.apply_kt_inference_config(finetuning_args, model_args.model_max_length)
+
     return model_args, data_args, finetuning_args, generating_args
 
 
@@ -623,6 +640,10 @@ def get_eval_args(args: dict[str, Any] | list[str] | None = None) -> _EVAL_CLS:
     _check_extra_dependencies(model_args, finetuning_args)
 
     model_args.device_map = "auto"
+
+    if model_args.use_kt:
+        model_args.model_max_length = data_args.cutoff_len
+        model_args.apply_kt_inference_config(finetuning_args, model_args.model_max_length)
 
     transformers.set_seed(eval_args.seed)
 

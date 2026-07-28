@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from datasets import load_dataset
-from packaging.version import Version
 from transformers import BitsAndBytesConfig, EetqConfig, GPTQConfig, HqqConfig
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import is_fsdp_enabled
@@ -41,32 +40,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
-
-
-def _patch_deepseek_remote_code_compatibility() -> None:
-    r"""Restore the Transformers 4.x availability helper used by DeepSeek remote code."""
-    import transformers
-    from transformers.utils import import_utils
-
-    if hasattr(import_utils, "is_torch_fx_available"):
-        return
-
-    transformers_version = Version(transformers.__version__)
-    if not (Version("5.0.0") <= transformers_version < Version("6.0.0")):
-        raise RuntimeError(
-            "DeepSeek-V3 remote-code compatibility requires Transformers 5.x when "
-            "`is_torch_fx_available` is absent, got Transformers "
-            f"{transformers.__version__}."
-        )
-
-    is_torch_available = getattr(import_utils, "is_torch_available", None)
-    if not callable(is_torch_available):
-        raise RuntimeError(
-            "Cannot provide DeepSeek-V3 remote-code compatibility because Transformers "
-            "does not expose `is_torch_available`."
-        )
-
-    import_utils.is_torch_fx_available = is_torch_available
 
 
 def _cap_kt_deepseek_rope_cache(config: "PretrainedConfig", model_args: "ModelArguments") -> None:
@@ -247,6 +220,20 @@ def configure_quantization(
 
         quantization_config: dict[str, Any] = getattr(config, "quantization_config", None)
         quant_method = quantization_config.get("quant_method", "")
+        use_kt_non_expert_cache = (
+            getattr(model_args, "use_kt", False)
+            and getattr(model_args, "kt_expert_weight_format", None) == "int8"
+            and bool(getattr(model_args, "kt_non_expert_weight_path", None))
+            and getattr(config, "model_type", None) == "deepseek_v3"
+            and quant_method == QuantizationMethod.FP8
+        )
+        if use_kt_non_expert_cache:
+            _cap_kt_deepseek_rope_cache(config, model_args)
+            logger.info_rank0(
+                "Loading validated BF16 non-expert cache; the source FP8 quantizer "
+                "will be disabled by the Transformers KT integration."
+            )
+            return
 
         kt_backend = os.environ.get("ACCELERATE_KT_BACKEND", "")
         kt_kgroup_path = (
@@ -286,7 +273,6 @@ def configure_quantization(
                 and getattr(config, "model_type", None) == "deepseek_v3"
             )
             if is_kt_int8_deepseek:
-                _patch_deepseek_remote_code_compatibility()
                 _cap_kt_deepseek_rope_cache(config, model_args)
 
             quant_config = FineGrainedFP8Config(dequantize=True)

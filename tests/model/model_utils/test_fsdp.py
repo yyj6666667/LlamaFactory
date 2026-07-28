@@ -30,15 +30,21 @@ def _accelerate_kt_prepare_model(accelerator, model):
     from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
 
     del FSDPModule, MixedPrecisionPolicy
-    frozen_params_to_ignore = set()
-    for _, param in model.named_parameters():
-        if not param.requires_grad:
-            frozen_params_to_ignore.add(param)
-
-    ignored = set()
-    fsdp2_kwargs = {}
-    fsdp2_kwargs["ignored_params"] = ignored | frozen_params_to_ignore
+    fsdp2_plugin = accelerator.state.fsdp_plugin
+    fsdp2_plugin.set_auto_wrap_policy(model)
+    fsdp2_kwargs = {"reshard_after_forward": fsdp2_plugin.reshard_after_forward}
     model = model.to(torch.device("meta"))
+
+    def fsdp2_prepare_auto_wrap_policy(plugin, prepared_model):
+        del prepared_model
+        return plugin.auto_wrap_policy
+
+    auto_wrap_policy_func = fsdp2_prepare_auto_wrap_policy(fsdp2_plugin, model)
+    if auto_wrap_policy_func is not None:
+        for module in list(model.modules())[:-1]:
+            if auto_wrap_policy_func(module):
+                fully_shard(module, **fsdp2_kwargs)
+
     fully_shard(model, **fsdp2_kwargs)
     return model
 
@@ -126,10 +132,24 @@ class _KTModel(torch.nn.Module):
         self.moe = _KTExpertWrapper()
 
 
+def _fsdp_plugin(ignored_modules=None):
+    plugin = SimpleNamespace(
+        auto_wrap_policy=None,
+        ignored_modules=ignored_modules,
+        reshard_after_forward=True,
+    )
+    plugin.set_auto_wrap_policy = lambda model: None
+    return plugin
+
+
 def _run_streaming_loader_worker(rank: int, init_file: str):
+    import weakref
+
     import torch.distributed as dist
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.tensor import DTensor, Shard
+
+    from llamafactory.model.model_utils import fsdp as fsdp_module
 
     dist.init_process_group(
         backend="gloo",
@@ -144,7 +164,7 @@ def _run_streaming_loader_worker(rank: int, init_file: str):
             chunk_size = (shape[0] + 1) // 2
             start = min(rank * chunk_size, shape[0])
             local_shape = (min(chunk_size, shape[0] - start), shape[1])
-            local = torch.empty(local_shape, dtype=torch.bfloat16)
+            local = torch.empty(local_shape, dtype=torch.bfloat16, device="meta")
             value = DTensor.from_local(
                 local,
                 device_mesh=mesh,
@@ -155,11 +175,27 @@ def _run_streaming_loader_worker(rank: int, init_file: str):
             )
             model.register_parameter(name, torch.nn.Parameter(value))
 
+        shared_local = torch.empty((2, 3), dtype=torch.bfloat16, device="meta")
+        shared_value = DTensor.from_local(
+            shared_local,
+            device_mesh=mesh,
+            placements=(Shard(0),),
+            run_check=False,
+            shape=torch.Size((4, 3)),
+            stride=(3, 1),
+        )
+        shared_parameter = torch.nn.Parameter(shared_value)
+        model.register_parameter("shared_left", shared_parameter)
+        model.register_parameter("shared_right", shared_parameter)
+
         if rank == 0:
             model.register_parameter("rank_zero_only", torch.nn.Parameter(torch.empty(2, dtype=torch.bfloat16)))
+            shared_full = torch.arange(12, 24, dtype=torch.bfloat16).reshape(4, 3)
             full_state = {
                 "even": torch.arange(12, dtype=torch.bfloat16).reshape(4, 3),
                 "uneven": torch.arange(15, dtype=torch.bfloat16).reshape(5, 3),
+                "shared_left": shared_full,
+                "shared_right": shared_full,
                 "rank_zero_only": torch.tensor([7.0, 11.0], dtype=torch.bfloat16),
                 "persistent": torch.tensor([2, 3, 5]),
             }
@@ -169,19 +205,45 @@ def _run_streaming_loader_worker(rank: int, init_file: str):
 
         accelerator = SimpleNamespace(is_main_process=rank == 0, device=torch.device("cpu"))
         original_requires_grad = model.even.requires_grad
-        _kt_fsdp2_streaming_load_full_state_dict(
-            accelerator,
-            model,
-            full_state,
-            rank_zero_only_names=frozenset({"rank_zero_only"}),
-        )
+        original_ids = {name: id(parameter) for name, parameter in model.named_parameters(remove_duplicate=False)}
+        original_install = fsdp_module._install_loaded_state_tensor
+        temporary_refs = []
+        peak_live_temporaries = 0
+        install_count = 0
+
+        def tracked_install(target, loaded):
+            nonlocal install_count, peak_live_temporaries, temporary_refs
+            original_install(target, loaded)
+            temporary_refs = [reference for reference in temporary_refs if reference() is not None]
+            temporary_refs.append(weakref.ref(loaded))
+            peak_live_temporaries = max(peak_live_temporaries, len(temporary_refs))
+            install_count += 1
+
+        fsdp_module._install_loaded_state_tensor = tracked_install
+        try:
+            _kt_fsdp2_streaming_load_full_state_dict(
+                accelerator,
+                model,
+                full_state,
+                rank_zero_only_names=frozenset({"rank_zero_only"}),
+            )
+        finally:
+            fsdp_module._install_loaded_state_tensor = original_install
 
         expected_even = torch.arange(12, dtype=torch.bfloat16).reshape(4, 3).chunk(2)[rank]
         expected_uneven = torch.arange(15, dtype=torch.bfloat16).reshape(5, 3).chunk(2)[rank]
+        expected_shared = torch.arange(12, 24, dtype=torch.bfloat16).reshape(4, 3).chunk(2)[rank]
         torch.testing.assert_close(model.even.to_local(), expected_even)
         torch.testing.assert_close(model.uneven.to_local(), expected_uneven)
+        torch.testing.assert_close(model.shared_left.to_local(), expected_shared)
         torch.testing.assert_close(model.persistent, torch.tensor([2, 3, 5]))
         assert model.even.requires_grad is original_requires_grad
+        assert model.shared_left is model.shared_right
+        assert install_count == (5 if rank == 0 else 4)
+        assert peak_live_temporaries == 1
+        assert {
+            name: id(parameter) for name, parameter in model.named_parameters(remove_duplicate=False)
+        } == original_ids
         if rank == 0:
             torch.testing.assert_close(
                 model.rank_zero_only,
@@ -189,6 +251,46 @@ def _run_streaming_loader_worker(rank: int, init_file: str):
             )
         else:
             assert not hasattr(model, "rank_zero_only")
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_streaming_loader_key_validation_worker(rank: int, init_file: str, error_kind: str):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        mesh = DeviceMesh("cpu", [0, 1])
+        local = torch.empty((1, 2), dtype=torch.bfloat16, device="meta")
+        value = DTensor.from_local(
+            local,
+            device_mesh=mesh,
+            placements=(Shard(0),),
+            run_check=False,
+            shape=torch.Size((2, 2)),
+            stride=(2, 1),
+        )
+        model = torch.nn.Module()
+        model.register_parameter("value", torch.nn.Parameter(value))
+        if rank == 0:
+            full_state = {"value": torch.ones(2, 2, dtype=torch.bfloat16)}
+            if error_kind == "missing":
+                full_state = {}
+            elif error_kind == "unexpected":
+                full_state["extra"] = torch.ones(1, dtype=torch.bfloat16)
+        else:
+            full_state = {}
+
+        accelerator = SimpleNamespace(is_main_process=rank == 0, device=torch.device("cpu"))
+        with pytest.raises(RuntimeError, match=f"rank-0 full state dict .*{error_kind} keys"):
+            _kt_fsdp2_streaming_load_full_state_dict(accelerator, model, full_state)
     finally:
         dist.destroy_process_group()
 
@@ -228,6 +330,16 @@ def test_streaming_loader_shards_even_and_uneven_tensors_and_preserves_rank_owne
     )
 
 
+@pytest.mark.parametrize("error_kind", ["missing", "unexpected"])
+def test_streaming_loader_strictly_rejects_invalid_rank_zero_key_sets(tmp_path, error_kind):
+    torch.multiprocessing.spawn(
+        _run_streaming_loader_key_validation_worker,
+        args=(str(tmp_path / f"gloo_{error_kind}"), error_kind),
+        nprocs=2,
+        join=True,
+    )
+
+
 def test_fsdp2_patch_filters_broad_frozen_ignore_and_preserves_identity(monkeypatch):
     accelerator_module, accelerate_utils, fsdp_utils = _install_fake_accelerate(monkeypatch)
     model_args = SimpleNamespace(use_kt=True, kt_expert_weight_format="int8")
@@ -252,9 +364,7 @@ def test_fsdp2_patch_filters_broad_frozen_ignore_and_preserves_identity(monkeypa
     assert accelerator_module.fsdp2_prepare_model is fsdp_utils.fsdp2_prepare_model
     assert accelerator_module.fsdp2_prepare_model is not _accelerate_kt_prepare_model
 
-    accelerator = SimpleNamespace(
-        state=SimpleNamespace(fsdp_plugin=SimpleNamespace(ignored_modules=[model.user_ignored]))
-    )
+    accelerator = SimpleNamespace(state=SimpleNamespace(fsdp_plugin=_fsdp_plugin([model.user_ignored])))
     prepared_model = accelerator_module.fsdp2_prepare_model(accelerator, model)
 
     expected_ignored = explicit_kt_params | set(model.user_ignored.parameters())
@@ -285,7 +395,7 @@ def test_fsdp2_patch_rejects_nonfloating_frozen_param_outside_kt(monkeypatch):
         "packed_weight",
         torch.nn.Parameter(torch.ones(4, dtype=torch.int8), requires_grad=False),
     )
-    accelerator = SimpleNamespace(state=SimpleNamespace(fsdp_plugin=SimpleNamespace(ignored_modules=None)))
+    accelerator = SimpleNamespace(state=SimpleNamespace(fsdp_plugin=_fsdp_plugin()))
 
     patch_fsdp2_kt_parameter_identity(model_args)
 

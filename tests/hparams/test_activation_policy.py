@@ -15,6 +15,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from llamafactory.hparams import model_args as model_args_module
 from llamafactory.hparams.model_args import ModelArguments
@@ -160,3 +161,88 @@ def test_llamafactory_checkpointing_uses_kt_context(monkeypatch: pytest.MonkeyPa
 
     assert captured_kwargs == {"use_reentrant": False, "context_fn": context_fn}
     assert model.config.use_cache is False
+
+
+def test_deepseek_int8_native_config_contract():
+    native_config_type = type(
+        "DeepseekV3Config",
+        (),
+        {"__module__": "transformers.models.deepseek_v3.configuration_deepseek_v3"},
+    )
+    config = native_config_type()
+    config.model_type = "deepseek_v3"
+    config.num_hidden_layers = 61
+    config.first_k_dense_replace = 3
+    config.n_routed_experts = 256
+    model_args = ModelArguments(
+        model_name_or_path="dummy",
+        use_kt=True,
+        kt_expert_weight_format="int8",
+        kt_weight_path="/tmp/int8",
+        activation_policy={"cpu": "retain", "gpu": "recompute"},
+    )
+
+    checkpointing.validate_kt_deepseek_v3_native_config(config, model_args)
+
+
+def test_deepseek_int8_rejects_remote_config():
+    remote_config_type = type("DeepseekV3Config", (), {"__module__": "transformers_modules.deepseek.modeling"})
+    config = remote_config_type()
+    config.model_type = "deepseek_v3"
+    config.num_hidden_layers = 61
+    config.first_k_dense_replace = 3
+    config.n_routed_experts = 256
+    model_args = ModelArguments(
+        model_name_or_path="dummy",
+        use_kt=True,
+        kt_expert_weight_format="int8",
+        kt_weight_path="/tmp/int8",
+        activation_policy={"cpu": "retain", "gpu": "recompute"},
+    )
+
+    with pytest.raises(RuntimeError, match="native"):
+        checkpointing.validate_kt_deepseek_v3_native_config(config, model_args)
+
+
+def test_deepseek_int8_checkpoint_contract_covers_all_native_layers():
+    modeling_layers = pytest.importorskip("transformers.modeling_layers")
+    gradient_layer_type = modeling_layers.GradientCheckpointingLayer
+    context_fn = object()
+
+    class DeepseekV3DecoderLayer(gradient_layer_type):
+        def __init__(self, layer_idx):
+            super().__init__()
+            self.proj = torch.nn.Linear(2, 2)
+            self.gradient_checkpointing = True
+            self._gradient_checkpointing_func = lambda *args, **kwargs: None
+            self._gradient_checkpointing_func._llamafactory_checkpoint_contract = {
+                "use_reentrant": False,
+                "context_fn": context_fn,
+            }
+            if layer_idx >= 3:
+                self.mlp = torch.nn.Module()
+                self.mlp._is_kt_moe_wrapper = True
+                self.mlp.layer_idx = layer_idx
+
+    class Backbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([DeepseekV3DecoderLayer(layer_idx) for layer_idx in range(61)])
+
+    class DeepseekV3ForCausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Backbone()
+            self.config = SimpleNamespace(use_cache=False)
+
+    DeepseekV3ForCausalLM.__module__ = "transformers.models.deepseek_v3.modeling_deepseek_v3"
+    model_args = ModelArguments(
+        model_name_or_path="dummy",
+        use_kt=True,
+        kt_expert_weight_format="int8",
+        kt_weight_path="/tmp/int8",
+        activation_policy={"cpu": "retain", "gpu": "recompute"},
+    )
+    model_args.kt_activation_checkpoint_context_fn = context_fn
+
+    checkpointing._validate_kt_deepseek_v3_checkpointing(DeepseekV3ForCausalLM(), model_args)

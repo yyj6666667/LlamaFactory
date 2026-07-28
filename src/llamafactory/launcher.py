@@ -25,6 +25,7 @@ USAGE = (
     + "|   llamafactory-cli api -h: launch an OpenAI-style API server       |\n"
     + "|   llamafactory-cli chat -h: launch a chat interface in CLI         |\n"
     + "|   llamafactory-cli export -h: merge LoRA adapters and export model |\n"
+    + "|   llamafactory-cli prepare-kt-cache: prepare KT non-expert weights |\n"
     + "|   llamafactory-cli train -h: train models                          |\n"
     + "|   llamafactory-cli webchat -h: launch a chat interface in Web UI   |\n"
     + "|   llamafactory-cli webui: launch LlamaBoard                        |\n"
@@ -150,6 +151,11 @@ def launch():
         from .train.tuner import export_model
 
         export_model()
+
+    elif command == "prepare-kt-cache":
+        from .extras.kt_cache import prepare_kt_cache_cli
+
+        prepare_kt_cache_cli()
 
     elif command == "train":
         from .train.tuner import run_exp

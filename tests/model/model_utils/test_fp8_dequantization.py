@@ -21,7 +21,6 @@ from transformers.integrations.finegrained_fp8 import Fp8Dequantize
 
 from llamafactory.model.model_utils.quantization import (
     _cap_kt_deepseek_rope_cache,
-    _patch_deepseek_remote_code_compatibility,
     _patch_fp8_partial_block_dequantization,
     configure_quantization,
 )
@@ -142,26 +141,6 @@ def test_fp8_partial_block_dequantization_rejects_wrong_scale_shape():
         )
 
 
-def test_deepseek_remote_code_compatibility_bridge(monkeypatch):
-    from transformers.utils import import_utils
-
-    monkeypatch.delattr(import_utils, "is_torch_fx_available", raising=False)
-    _patch_deepseek_remote_code_compatibility()
-
-    assert import_utils.is_torch_fx_available is import_utils.is_torch_available
-
-
-def test_deepseek_remote_code_compatibility_rejects_unknown_version(monkeypatch):
-    import transformers
-    from transformers.utils import import_utils
-
-    monkeypatch.delattr(import_utils, "is_torch_fx_available", raising=False)
-    monkeypatch.setattr(transformers, "__version__", "6.0.0")
-
-    with pytest.raises(RuntimeError, match="requires Transformers 5.x"):
-        _patch_deepseek_remote_code_compatibility()
-
-
 def test_kt_int8_dequantizes_non_expert_fp8_weights():
     config = SimpleNamespace(model_type="deepseek_v3", quantization_config={"quant_method": "fp8"})
     model_args = SimpleNamespace(
@@ -177,3 +156,26 @@ def test_kt_int8_dequantizes_non_expert_fp8_weights():
     assert init_kwargs["quantization_config"].dequantize is True
     assert init_kwargs["quantization_config"]._llamafactory_dequantization_dtype == torch.bfloat16
     assert init_kwargs["ignore_mismatched_sizes"] is True
+
+
+def test_kt_int8_bf16_cache_skips_online_fp8_dequantization():
+    config = SimpleNamespace(
+        model_type="deepseek_v3",
+        max_position_embeddings=163840,
+        quantization_config={"quant_method": "fp8"},
+    )
+    model_args = SimpleNamespace(
+        quantization_bit=None,
+        use_kt=True,
+        kt_weight_path="/tmp/int8-weights",
+        kt_non_expert_weight_path="/tmp/bf16-cache",
+        kt_expert_weight_format="int8",
+        model_max_length=1024,
+    )
+    init_kwargs = {}
+
+    configure_quantization(config, None, model_args, True, init_kwargs)
+
+    assert "quantization_config" not in init_kwargs
+    assert "ignore_mismatched_sizes" not in init_kwargs
+    assert config.max_position_embeddings == 1024
