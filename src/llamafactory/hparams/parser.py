@@ -252,7 +252,7 @@ def _check_extra_dependencies(
 ) -> None:
     if model_args.use_kt:
         if model_args.kt_expert_weight_format == "int8":
-            check_version("kt-kernel==0.6.3.post1", mandatory=True)
+            check_version("kt-kernel==0.6.4", mandatory=True)
             check_version("transformers-kt==5.6.0.post1", mandatory=True)
             check_version("accelerate-kt==1.14.0.post1", mandatory=True)
         else:
