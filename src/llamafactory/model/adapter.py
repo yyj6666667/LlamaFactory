@@ -20,7 +20,6 @@ from peft import LoraConfig, LoraModel, OFTConfig, PeftModel, TaskType, get_peft
 from transformers.integrations import is_deepspeed_zero3_enabled
 
 from ..extras import logging
-from ..extras.constants import EngineName
 from .model_utils.misc import find_all_linear_modules, find_expanded_modules
 from .model_utils.quantization import QuantizationMethod
 from .model_utils.unsloth import get_unsloth_peft_model, load_unsloth_peft_model
@@ -34,6 +33,31 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _get_kt_fused_expert_exclude_pattern(model: "PreTrainedModel") -> str:
+    r"""Build a PEFT exclusion pattern for expert projections owned by KT fused LoRA."""
+    expert_prefixes = []
+    projection_names = set()
+    for module_name, module in model.named_modules():
+        if not (getattr(module, "_is_kt_moe_wrapper", False) and getattr(module, "_force_fused_expert_lora", False)):
+            continue
+
+        experts_attr = getattr(module, "_experts_attr", None)
+        moe_config = getattr(module, "moe_config", None)
+        weight_names = getattr(moe_config, "weight_names", None)
+        if not isinstance(experts_attr, str) or not experts_attr or not weight_names:
+            raise RuntimeError("KT fused expert LoRA wrapper does not expose its expert projection layout.")
+
+        expert_prefixes.append(re.escape(f"{module_name}.{experts_attr}"))
+        projection_names.update(re.escape(name) for name in weight_names)
+
+    if not expert_prefixes:
+        raise RuntimeError("KT fused expert LoRA was requested, but no forced-fused KT wrappers were found.")
+
+    prefixes = "|".join(expert_prefixes)
+    projections = "|".join(sorted(projection_names))
+    return rf"(?:{prefixes})\.\d+\.(?:{projections})"
 
 
 def _setup_full_tuning(
@@ -200,6 +224,9 @@ def _setup_lora_tuning(
             else:
                 model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
 
+            if model_args.use_kt:
+                model._kt_adapter_path = adapter_to_resume
+
         logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
 
     if is_trainable and adapter_to_resume is None:  # create new lora weights while training
@@ -250,6 +277,10 @@ def _setup_lora_tuning(
                 "modules_to_save": finetuning_args.additional_target,
             }
 
+        if finetuning_args.finetuning_type == "lora" and getattr(model_args, "kt_force_fused_expert_lora", False):
+            peft_kwargs["exclude_modules"] = _get_kt_fused_expert_exclude_pattern(model)
+            logger.info_rank0("Excluding routed expert Linear modules from PEFT; KT owns fused expert LoRA.")
+
         if model_args.use_kt:
             if finetuning_args.finetuning_type != "lora":
                 raise ValueError("KTransformers only supports LoRA finetuning.")
@@ -287,6 +318,13 @@ def _setup_lora_tuning(
     if is_trainable and cast_trainable_params_to_fp32:
         for param in filter(lambda p: p.requires_grad, model.parameters()):
             param.data = param.data.to(torch.float32)
+
+    if model_args.use_kt and adapter_to_resume is not None and not is_trainable:
+        from kt_kernel.sft import kt_adapt_peft_lora, load_kt_moe_from_adapter
+
+        kt_adapt_peft_lora(model)
+        load_kt_moe_from_adapter(model, adapter_to_resume)
+        model._kt_adapter_loaded = True
 
     return model
 

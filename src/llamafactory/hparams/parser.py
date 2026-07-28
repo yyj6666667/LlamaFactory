@@ -60,6 +60,17 @@ _KT_LEGACY_ACTIVATION_ARGS = {
     "use_reentrant_gc",
     "use_unsloth_gc",
 }
+_KT_ONLY_ARGS = {
+    "activation_policy",
+    "kt_backend",
+    "kt_expert_weight_format",
+    "kt_force_fused_expert_lora",
+    "kt_num_gpu_experts",
+    "kt_share_backward_bb",
+    "kt_threadpool_count",
+    "kt_tp_enabled",
+    "kt_weight_lifecycle",
+}
 
 if is_mcore_adapter_available() and is_env_enabled("USE_MCA"):
     from mcore_adapter import TrainingArguments as McaTrainingArguments
@@ -104,8 +115,13 @@ def _get_explicit_arg_names(args: dict[str, Any] | list[str]) -> set[str]:
 
 def _validate_kt_activation_policy_source(model_args: "ModelArguments", explicit_args: set[str]) -> None:
     if not model_args.use_kt:
-        if "activation_policy" in explicit_args:
-            raise ValueError("`activation_policy` is only valid when `use_kt: true`.")
+        kt_only_args = sorted(_KT_ONLY_ARGS & explicit_args)
+        if kt_only_args:
+            if len(kt_only_args) == 1:
+                raise ValueError(f"`{kt_only_args[0]}` is only valid when `use_kt: true`.")
+
+            raise ValueError(f"KTransformers arguments {kt_only_args} are only valid when `use_kt: true`.")
+
         return
 
     conflicting_args = sorted(_KT_LEGACY_ACTIVATION_ARGS & explicit_args)
@@ -199,6 +215,8 @@ def _verify_model_args(
     data_args: "DataArguments",
     finetuning_args: "FinetuningArguments",
 ) -> None:
+    model_args.validate_kt_finetuning(finetuning_args)
+
     if model_args.adapter_name_or_path is not None and finetuning_args.finetuning_type != "lora":
         raise ValueError("Adapter is only valid for the LoRA method.")
 

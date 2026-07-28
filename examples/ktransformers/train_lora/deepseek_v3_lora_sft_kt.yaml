@@ -1,5 +1,5 @@
 ### model
-model_name_or_path: deepseek-ai/DeepSeek-V3-0324-BF16 # need to convert to BF16 checkpoint first
+model_name_or_path: /mnt/data/models/DeepSeek-V3.1
 trust_remote_code: true
 
 ### method
@@ -7,31 +7,36 @@ stage: sft
 do_train: true
 finetuning_type: lora
 lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0
 lora_target: all
+pure_bf16: true
 
 ### dataset
 dataset: identity, alpaca_en_demo
 template: deepseek3
-cutoff_len: 2048
-max_samples: 100000
+cutoff_len: 1024
+max_samples: 64
 overwrite_cache: true
 preprocessing_num_workers: 16
 dataloader_num_workers: 4
+packing: true
+neat_packing: true
 
 ### output
 output_dir: saves/KT_FT_deepseekV3
-logging_steps: 10
-save_steps: 500
+logging_steps: 1
+save_strategy: "no"
 plot_loss: true
 overwrite_output_dir: true
-save_only_model: false
+save_only_model: true
 report_to: none  # choices: [none, wandb, tensorboard, swanlab, mlflow]
 
 ### train
 per_device_train_batch_size: 1
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 1
 learning_rate: 1.0e-4
-num_train_epochs: 3.0
+max_steps: 3
 lr_scheduler_type: cosine
 warmup_ratio: 0.1
 bf16: true
@@ -40,6 +45,13 @@ resume_from_checkpoint: null
 
 ### ktransformers
 use_kt: true
-# Pair with fsdp2_kt_bf16.yaml for original BF16 checkpoints.
-# For pre-converted expert weights, uncomment kt_weight_path and use fsdp2_kt_int8.yaml or fsdp2_kt_int4.yaml.
-# kt_weight_path: /path/to/DeepSeek-V3-AMXINT8
+kt_expert_weight_format: int8
+kt_weight_path: /mnt/data/models/kt-int8-dsv31-20260728-int8
+kt_weight_lifecycle: persistent
+kt_backend: AMXINT8
+kt_tp_enabled: true
+kt_threadpool_count: 2
+kt_num_gpu_experts: 0
+kt_share_backward_bb: true
+kt_force_fused_expert_lora: true
+activation_policy: {cpu: retain, gpu: recompute}

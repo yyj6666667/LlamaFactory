@@ -490,6 +490,44 @@ class KTransformersArguments:
         default=None,
         metadata={"help": "Path to pre-quantized INT8 expert weights (.kt files)."},
     )
+    kt_expert_weight_format: Literal["int8"] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Format of pre-quantized KTransformers expert weights. "
+                "Currently only `int8` is supported for frozen-base LoRA training."
+            )
+        },
+    )
+    kt_weight_lifecycle: Literal["persistent", "ephemeral"] = field(
+        default="persistent",
+        metadata={
+            "help": (
+                "Lifecycle of pre-quantized KTransformers expert weights. "
+                "`ephemeral` allows the backend to remove consumed temporary weight files."
+            )
+        },
+    )
+    kt_backend: str | None = field(
+        default=None,
+        metadata={"help": "KTransformers CPU expert backend. INT8 LoRA requires `AMXINT8`."},
+    )
+    kt_tp_enabled: bool | None = field(
+        default=None,
+        metadata={"help": "Whether to tensor-parallelize KTransformers CPU experts."},
+    )
+    kt_threadpool_count: int | None = field(
+        default=None,
+        metadata={"help": "Number of KTransformers CPU expert tensor-parallel partitions."},
+    )
+    kt_num_gpu_experts: int | None = field(
+        default=None,
+        metadata={"help": "Number of base experts placed on GPU."},
+    )
+    kt_share_backward_bb: bool | None = field(
+        default=None,
+        metadata={"help": "Whether INT8 expert backward reuses the shared repacked weight buffer."},
+    )
     kt_expert_checkpoint_path: str | None = field(
         default=None,
         metadata={"help": "Path to expert checkpoint (safetensors) for online conversion."},
@@ -558,6 +596,99 @@ class KTransformersArguments:
 
         self.activation_policy = policy
 
+        if self.kt_expert_weight_format not in {None, "int8"}:
+            raise ValueError(f"`kt_expert_weight_format` must be `int8`, got {self.kt_expert_weight_format!r}.")
+
+        if self.kt_weight_lifecycle not in {"persistent", "ephemeral"}:
+            raise ValueError(
+                f"`kt_weight_lifecycle` must be `persistent` or `ephemeral`, got {self.kt_weight_lifecycle!r}."
+            )
+
+    def validate_kt_finetuning(self, finetuning_args: Any) -> None:
+        r"""Validate the LLaMA-Factory-facing contract for pre-quantized KT LoRA training."""
+        if not self.use_kt:
+            if self.kt_expert_weight_format is not None or self.kt_weight_lifecycle != "persistent":
+                raise ValueError("KTransformers weight format and lifecycle require `use_kt: true`.")
+
+            return
+
+        if self.kt_weight_lifecycle == "ephemeral" and self.kt_expert_weight_format is None:
+            raise ValueError("`kt_weight_lifecycle: ephemeral` requires an explicit `kt_expert_weight_format`.")
+
+        if self.kt_expert_weight_format != "int8":
+            return
+
+        fixed_runtime = {
+            "kt_backend": "AMXINT8",
+            "kt_tp_enabled": True,
+            "kt_threadpool_count": 2,
+            "kt_num_gpu_experts": 0,
+            "kt_share_backward_bb": True,
+            "kt_force_fused_expert_lora": True,
+        }
+        for name, expected in fixed_runtime.items():
+            value = getattr(self, name)
+            if value is None:
+                setattr(self, name, expected)
+            elif value != expected:
+                raise ValueError(f"KTransformers INT8 LoRA requires `{name}: {str(expected).lower()}`.")
+
+        if getattr(finetuning_args, "stage", None) != "sft":
+            raise ValueError("KTransformers INT8 training currently supports only `stage: sft`.")
+
+        if getattr(finetuning_args, "finetuning_type", None) != "lora":
+            raise ValueError(
+                "KTransformers INT8 training currently supports only frozen-base `finetuning_type: lora`."
+            )
+
+        if not self.kt_weight_path:
+            raise ValueError("`kt_expert_weight_format: int8` requires `kt_weight_path`.")
+
+        if self.kt_weight_lifecycle != "persistent":
+            raise ValueError("KTransformers INT8 LoRA requires `kt_weight_lifecycle: persistent`.")
+
+        if self.activation_policy != {"cpu": "retain", "gpu": "recompute"}:
+            raise ValueError("KTransformers INT8 LoRA requires `activation_policy: {cpu: retain, gpu: recompute}`.")
+
+        if self.kt_expert_checkpoint_path is not None:
+            raise ValueError(
+                "`kt_expert_weight_format: int8` accepts pre-quantized weights only; "
+                "remove `kt_expert_checkpoint_path`."
+            )
+
+        if (
+            self.kt_use_lora_experts
+            or (self.kt_lora_expert_num or 0) > 0
+            or self.kt_lora_expert_intermediate_size is not None
+        ):
+            raise ValueError("KTransformers INT8 LoRA does not support GPU-side LoRA experts.")
+
+        if self.kt_skip_expert_lora_adaptation:
+            raise ValueError("KTransformers INT8 LoRA does not support skipping expert LoRA adaptation.")
+
+        if getattr(finetuning_args, "lora_dropout", 0.0) != 0.0:
+            raise ValueError("KTransformers INT8 expert LoRA requires `lora_dropout: 0`.")
+
+        if getattr(finetuning_args, "lora_rank", None) != 8:
+            raise ValueError("KTransformers INT8 LoRA requires `lora_rank: 8`.")
+
+        if getattr(finetuning_args, "lora_alpha", None) != 16:
+            raise ValueError("KTransformers INT8 LoRA requires `lora_alpha: 16`.")
+
+        if getattr(finetuning_args, "lora_target", ["all"]) != ["all"]:
+            raise ValueError("KTransformers INT8 LoRA requires `lora_target: all`.")
+
+        if getattr(finetuning_args, "use_rslora", False):
+            raise ValueError("KTransformers INT8 expert LoRA does not support `use_rslora`.")
+
+        if not getattr(finetuning_args, "pure_bf16", False):
+            raise ValueError("KTransformers INT8 LoRA requires `pure_bf16: true` for LoRA parameters and gradients.")
+
+        if getattr(finetuning_args, "additional_target", None):
+            raise ValueError(
+                "KTransformers INT8 LoRA requires a frozen base and does not support `additional_target`."
+            )
+
     def apply_activation_policy(self, training_args: Any) -> None:
         r"""Make the KT activation policy authoritative for both checkpointing entry points."""
         gpu_policy = self.activation_policy["gpu"]
@@ -588,6 +719,13 @@ class KTransformersArguments:
             "kt_lora_rank": getattr(finetuning_args, "lora_rank", None),
             "kt_lora_alpha": getattr(finetuning_args, "lora_alpha", None),
             "kt_weight_path": self.kt_weight_path,
+            "kt_expert_weight_format": self.kt_expert_weight_format,
+            "kt_weight_lifecycle": self.kt_weight_lifecycle,
+            "kt_backend": self.kt_backend,
+            "kt_tp_enabled": self.kt_tp_enabled,
+            "kt_threadpool_count": self.kt_threadpool_count,
+            "kt_num_gpu_experts": self.kt_num_gpu_experts,
+            "kt_share_backward_bb": self.kt_share_backward_bb,
             "kt_expert_checkpoint_path": self.kt_expert_checkpoint_path,
             "kt_model_max_length": kt_model_max_length,
             "kt_use_lora_experts": self.kt_use_lora_experts,
@@ -606,10 +744,40 @@ class KTransformersArguments:
         if not self.use_kt:
             return
 
+        self.validate_kt_finetuning(finetuning_args)
+        if self.kt_expert_weight_format == "int8" and not getattr(training_args, "bf16", False):
+            raise ValueError("KTransformers INT8 LoRA requires `bf16: true` for LoRA, activations, and gradients.")
+
+        hf_kt = getattr(training_args, "hf_kt_config", None)
+        existing_kt_config = getattr(hf_kt, "_kt_config", None)
+        if self.kt_expert_weight_format == "int8" and isinstance(existing_kt_config, dict):
+            for name in (
+                "kt_backend",
+                "kt_tp_enabled",
+                "kt_threadpool_count",
+                "kt_num_gpu_experts",
+                "kt_share_backward_bb",
+                "kt_force_fused_expert_lora",
+            ):
+                existing = existing_kt_config.get(name)
+                expected = getattr(self, name)
+                if existing is not None and existing != expected:
+                    raise ValueError(
+                        f"Accelerate `{name}: {str(existing).lower()}` conflicts with the required "
+                        f"KTransformers INT8 LoRA setting `{name}: {str(expected).lower()}`."
+                    )
+
         self.apply_activation_policy(training_args)
         kt_config = self.get_kt_config_dict(finetuning_args, model_max_length)
         env_mapping = {
             "kt_weight_path": "ACCELERATE_KT_WEIGHT_PATH",
+            "kt_expert_weight_format": "ACCELERATE_KT_EXPERT_WEIGHT_FORMAT",
+            "kt_weight_lifecycle": "ACCELERATE_KT_WEIGHT_LIFECYCLE",
+            "kt_backend": "ACCELERATE_KT_BACKEND",
+            "kt_tp_enabled": "ACCELERATE_KT_TP_ENABLED",
+            "kt_threadpool_count": "ACCELERATE_KT_THREADPOOL_COUNT",
+            "kt_num_gpu_experts": "ACCELERATE_KT_NUM_GPU_EXPERTS",
+            "kt_share_backward_bb": "ACCELERATE_KT_SHARE_BACKWARD_BB",
             "kt_expert_checkpoint_path": "ACCELERATE_KT_EXPERT_CHECKPOINT_PATH",
             "kt_model_max_length": "ACCELERATE_KT_MODEL_MAX_LENGTH",
             "kt_lora_rank": "ACCELERATE_KT_LORA_RANK",
@@ -627,7 +795,6 @@ class KTransformersArguments:
             if value is not None:
                 os.environ[env_key] = str(value)
 
-        hf_kt = getattr(training_args, "hf_kt_config", None)
         if hf_kt is None or not hasattr(hf_kt, "_kt_config") or not isinstance(hf_kt._kt_config, dict):
             return
 

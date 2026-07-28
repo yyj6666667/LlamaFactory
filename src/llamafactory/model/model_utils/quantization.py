@@ -18,10 +18,13 @@
 
 import os
 import random
+from functools import wraps
+from inspect import Parameter, signature
 from typing import TYPE_CHECKING, Any
 
 import torch
 from datasets import load_dataset
+from packaging.version import Version
 from transformers import BitsAndBytesConfig, EetqConfig, GPTQConfig, HqqConfig
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import is_fsdp_enabled
@@ -38,6 +41,106 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _patch_deepseek_remote_code_compatibility() -> None:
+    r"""Restore the Transformers 4.x availability helper used by DeepSeek remote code."""
+    import transformers
+    from transformers.utils import import_utils
+
+    if hasattr(import_utils, "is_torch_fx_available"):
+        return
+
+    transformers_version = Version(transformers.__version__)
+    if not (Version("5.0.0") <= transformers_version < Version("6.0.0")):
+        raise RuntimeError(
+            "DeepSeek-V3 remote-code compatibility requires Transformers 5.x when "
+            "`is_torch_fx_available` is absent, got Transformers "
+            f"{transformers.__version__}."
+        )
+
+    is_torch_available = getattr(import_utils, "is_torch_available", None)
+    if not callable(is_torch_available):
+        raise RuntimeError(
+            "Cannot provide DeepSeek-V3 remote-code compatibility because Transformers "
+            "does not expose `is_torch_available`."
+        )
+
+    import_utils.is_torch_fx_available = is_torch_available
+
+
+def _patch_fp8_partial_block_dequantization() -> None:
+    from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+
+    if getattr(Fp8Dequantize, "_llamafactory_partial_block_support", False):
+        return
+
+    original_convert = Fp8Dequantize.convert
+    convert_signature = signature(original_convert)
+    expected_parameters = {"self", "input_dict", "full_layer_name"}
+    if not expected_parameters.issubset(convert_signature.parameters) or not any(
+        parameter.kind == Parameter.VAR_KEYWORD for parameter in convert_signature.parameters.values()
+    ):
+        raise RuntimeError(
+            "Unsupported Transformers `Fp8Dequantize.convert` signature for partial-block dequantization: "
+            f"{convert_signature}."
+        )
+
+    @wraps(original_convert)
+    def convert(self, input_dict, full_layer_name=None, **kwargs):
+        output_dtype = getattr(
+            self.hf_quantizer.quantization_config,
+            "_llamafactory_dequantization_dtype",
+            None,
+        )
+
+        def cast_output(converted):
+            if output_dtype is None:
+                return converted
+
+            def cast_tensor(tensor):
+                if isinstance(tensor, list):
+                    return [item.to(output_dtype) for item in tensor]
+                if isinstance(tensor, tuple):
+                    return tuple(item.to(output_dtype) for item in tensor)
+
+                return tensor.to(output_dtype)
+
+            return {name: cast_tensor(tensor) for name, tensor in converted.items()}
+
+        quantized_values = input_dict.get("weight$")
+        scale_values = input_dict.get("weight_scale_inv")
+        if quantized_values is None or scale_values is None:
+            return cast_output(original_convert(self, input_dict, full_layer_name=full_layer_name, **kwargs))
+
+        quantized = quantized_values[0] if isinstance(quantized_values, list) else quantized_values
+        scales = scale_values[0] if isinstance(scale_values, list) else scale_values
+        rows, cols = quantized.shape[-2:]
+        block_size = self.hf_quantizer.quantization_config.weight_block_size
+        if block_size is None:
+            return cast_output(original_convert(self, input_dict, full_layer_name=full_layer_name, **kwargs))
+
+        block_m, block_n = block_size
+        scale_shape = ((rows + block_m - 1) // block_m, (cols + block_n - 1) // block_n)
+        if rows % block_m == 0 and cols % block_n == 0:
+            return cast_output(original_convert(self, input_dict, full_layer_name=full_layer_name, **kwargs))
+
+        if scales.shape[-2:] != scale_shape:
+            raise ValueError(
+                f"FP8 scale dimensions {tuple(scales.shape[-2:])} do not match the expected partial-block "
+                f"shape {scale_shape} for matrix dimensions ({rows}, {cols}) and block sizes ({block_m}, {block_n})."
+            )
+
+        expanded_scales = scales.repeat_interleave(block_m, dim=-2)
+        expanded_scales = expanded_scales.repeat_interleave(block_n, dim=-1)[..., :rows, :cols]
+        dequantized = quantized.to(scales.dtype) * expanded_scales
+        if output_dtype is not None:
+            dequantized = dequantized.to(output_dtype)
+
+        return {full_layer_name: dequantized}
+
+    Fp8Dequantize.convert = convert
+    Fp8Dequantize._llamafactory_partial_block_support = True
 
 
 def _get_quantization_dataset(tokenizer: "PreTrainedTokenizer", model_args: "ModelArguments") -> list[dict[str, Any]]:
@@ -126,7 +229,19 @@ def configure_quantization(
         if quant_method == QuantizationMethod.FP8:
             from transformers import FineGrainedFP8Config
 
+            is_kt_int8_deepseek = (
+                getattr(model_args, "use_kt", False)
+                and getattr(model_args, "kt_expert_weight_format", None) == "int8"
+                and getattr(config, "model_type", None) == "deepseek_v3"
+            )
+            if is_kt_int8_deepseek:
+                _patch_deepseek_remote_code_compatibility()
+                _patch_fp8_partial_block_dequantization()
+
             quant_config = FineGrainedFP8Config(dequantize=True)
+            if is_kt_int8_deepseek:
+                quant_config._llamafactory_dequantization_dtype = torch.bfloat16
+
             init_kwargs["quantization_config"] = quant_config
             init_kwargs["ignore_mismatched_sizes"] = True
 
