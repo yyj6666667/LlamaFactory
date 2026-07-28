@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import logging
 import re
 import threading
 import warnings
@@ -214,6 +215,263 @@ def _validate_shardable_frozen_params(
         )
 
 
+def _kt_fsdp2_cpu_shard(tensor: torch.Tensor, rank: int, world_size: int) -> torch.Tensor:
+    chunk_size = (tensor.size(0) + world_size - 1) // world_size
+    start = min(rank * chunk_size, tensor.size(0))
+    length = min(chunk_size, tensor.size(0) - start)
+    return tensor.narrow(0, start, length)
+
+
+def _kt_fsdp2_streaming_load_full_state_dict(
+    accelerator,
+    model: torch.nn.Module,
+    full_sd: dict,
+    cpu_offload: bool = False,
+    *,
+    rank_zero_only_names: frozenset[str] = frozenset(),
+):
+    """Load a KT FSDP2 state dict without ever materializing a full parameter on GPU."""
+    import torch.distributed as dist
+    from torch.distributed.tensor import DTensor, Shard
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("KT INT8 streaming FSDP2 loading requires an initialized process group.")
+    if not dist.is_gloo_available():
+        raise RuntimeError("KT INT8 streaming FSDP2 loading requires the Gloo backend.")
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    if world_size != 2:
+        raise RuntimeError(f"KT INT8 streaming FSDP2 loading currently requires exactly two ranks, got {world_size}.")
+
+    default_is_gloo = str(dist.get_backend()).lower() == "gloo"
+    cpu_group = dist.group.WORLD if default_is_gloo else dist.new_group(backend="gloo")
+    owns_cpu_group = cpu_group is not dist.group.WORLD
+
+    try:
+        sharded_state = model.state_dict()
+        errors = []
+        signature = []
+        parameter_requires_grad = {
+            name: parameter.requires_grad for name, parameter in model.named_parameters(remove_duplicate=False)
+        }
+
+        if cpu_offload:
+            errors.append("CPU offload is not supported.")
+        if bool(accelerator.is_main_process) != (rank == 0):
+            errors.append("Accelerator main-process ownership must be global rank 0.")
+        if torch.device(accelerator.device).type != "cpu" and torch.device(accelerator.device).index is None:
+            errors.append("Accelerator device must identify the local accelerator device.")
+
+        for name, sharded_value in sharded_state.items():
+            if rank == 0 and name not in full_sd:
+                errors.append(f"{name}: missing from the rank-0 full state dict.")
+                continue
+            if not isinstance(sharded_value, DTensor):
+                if name not in rank_zero_only_names:
+                    signature.append(
+                        (
+                            name,
+                            tuple(sharded_value.shape),
+                            tuple(sharded_value.stride()),
+                            str(sharded_value.dtype),
+                            "replicated",
+                        )
+                    )
+                if rank == 0:
+                    full_value = full_sd[name]
+                    if not isinstance(full_value, torch.Tensor):
+                        errors.append(f"{name}: rank-0 full state value must be a Tensor.")
+                    elif full_value.device.type != "cpu":
+                        errors.append(f"{name}: rank-0 full state value must remain on CPU, got {full_value.device}.")
+                    elif full_value.layout != torch.strided:
+                        errors.append(f"{name}: only dense strided rank-0 tensors are supported.")
+                    elif full_value.dtype != sharded_value.dtype:
+                        errors.append(
+                            f"{name}: rank-0 dtype {full_value.dtype} does not match model dtype {sharded_value.dtype}."
+                        )
+                    elif tuple(full_value.shape) != tuple(sharded_value.shape):
+                        errors.append(
+                            f"{name}: rank-0 shape {tuple(full_value.shape)} does not match "
+                            f"model shape {tuple(sharded_value.shape)}."
+                        )
+                    elif not full_value.is_contiguous():
+                        errors.append(f"{name}: rank-0 full state value must be contiguous.")
+                continue
+
+            mesh = sharded_value.device_mesh
+            placements = tuple(sharded_value.placements)
+            mesh_ranks = tuple(int(item) for item in mesh.mesh.reshape(-1).tolist())
+            if mesh.ndim != 1 or mesh_ranks != tuple(range(world_size)):
+                errors.append(f"{name}: expected a one-dimensional WORLD device mesh, got ranks {mesh_ranks}.")
+            if len(placements) != 1 or not isinstance(placements[0], Shard) or placements[0].dim != 0:
+                errors.append(f"{name}: only a single Shard(0) placement is supported, got {placements}.")
+            if mesh.device_type != torch.device(accelerator.device).type:
+                errors.append(
+                    f"{name}: DTensor mesh device type {mesh.device_type!r} does not match "
+                    f"Accelerator device {accelerator.device}."
+                )
+            if sharded_value.dtype != torch.bfloat16:
+                errors.append(f"{name}: KT INT8 FSDP2 requires BF16 DTensors, got {sharded_value.dtype}.")
+
+            local_shape = list(sharded_value.shape)
+            chunk_size = (sharded_value.shape[0] + world_size - 1) // world_size
+            start = min(rank * chunk_size, sharded_value.shape[0])
+            local_shape[0] = min(chunk_size, sharded_value.shape[0] - start)
+            if tuple(local_shape) != tuple(sharded_value.to_local().shape):
+                errors.append(
+                    f"{name}: computed local shape {tuple(local_shape)} does not match "
+                    f"FSDP local shape {tuple(sharded_value.to_local().shape)}."
+                )
+            if not sharded_value.to_local().is_contiguous():
+                errors.append(f"{name}: KT INT8 streaming loading requires contiguous local DTensor shards.")
+
+            signature.append(
+                (
+                    name,
+                    tuple(sharded_value.shape),
+                    tuple(sharded_value.stride()),
+                    str(sharded_value.dtype),
+                    mesh.device_type,
+                )
+            )
+
+            if rank != 0:
+                continue
+            full_value = full_sd[name]
+            if not isinstance(full_value, torch.Tensor):
+                errors.append(f"{name}: rank-0 full state value must be a Tensor.")
+            elif isinstance(full_value, DTensor):
+                errors.append(f"{name}: rank-0 full state value must not be a DTensor.")
+            elif full_value.device.type != "cpu":
+                errors.append(f"{name}: rank-0 full state value must remain on CPU, got {full_value.device}.")
+            elif full_value.layout != torch.strided:
+                errors.append(f"{name}: only dense strided rank-0 tensors are supported.")
+            elif full_value.dtype != torch.bfloat16:
+                errors.append(f"{name}: KT INT8 FSDP2 requires BF16 rank-0 tensors, got {full_value.dtype}.")
+            elif not full_value.is_contiguous():
+                errors.append(f"{name}: rank-0 full state value must be contiguous.")
+            elif tuple(full_value.shape) != tuple(sharded_value.shape):
+                errors.append(
+                    f"{name}: full shape {tuple(full_value.shape)} does not match DTensor shape "
+                    f"{tuple(sharded_value.shape)}."
+                )
+
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, (errors, signature), group=cpu_group)
+        all_errors = [
+            f"rank {peer_rank}: {error}"
+            for peer_rank, (peer_errors, _) in enumerate(gathered)
+            for error in peer_errors
+        ]
+        reference_signature = gathered[0][1]
+        for peer_rank, (_, peer_signature) in enumerate(gathered[1:], start=1):
+            if peer_signature != reference_signature:
+                all_errors.append(f"rank {peer_rank}: DTensor state signature differs from rank 0.")
+        if all_errors:
+            raise RuntimeError("KT INT8 streaming FSDP2 preflight failed: " + "; ".join(all_errors))
+
+        loaded_state = {}
+        local_dtype_bytes = {}
+        local_max_tensor_bytes = 0
+        global_dtype_bytes = {}
+        global_max_tensor_bytes = 0
+        for name, sharded_value in sharded_state.items():
+            if not isinstance(sharded_value, DTensor):
+                if name in rank_zero_only_names:
+                    loaded_state[name] = full_sd[name].detach() if rank == 0 else sharded_value
+                    continue
+
+                if rank == 0:
+                    local_cpu = full_sd[name].detach().to(dtype=sharded_value.dtype).contiguous()
+                else:
+                    local_cpu = torch.empty(
+                        tuple(sharded_value.shape),
+                        dtype=sharded_value.dtype,
+                        device="cpu",
+                    )
+                if local_cpu.numel() != 0:
+                    dist.broadcast(local_cpu, src=0, group=cpu_group)
+                loaded_state[name] = local_cpu.to(accelerator.device)
+                dtype_name = str(local_cpu.dtype)
+                tensor_bytes = local_cpu.numel() * local_cpu.element_size()
+                local_dtype_bytes[dtype_name] = local_dtype_bytes.get(dtype_name, 0) + tensor_bytes
+                local_max_tensor_bytes = max(local_max_tensor_bytes, tensor_bytes)
+                if rank == 0:
+                    global_dtype_bytes[dtype_name] = global_dtype_bytes.get(dtype_name, 0) + tensor_bytes
+                    global_max_tensor_bytes = max(global_max_tensor_bytes, tensor_bytes)
+                continue
+
+            global_shape = tuple(sharded_value.shape)
+            global_stride = tuple(sharded_value.stride())
+            target_dtype = sharded_value.dtype
+            mesh = sharded_value.device_mesh
+            placements = tuple(sharded_value.placements)
+
+            if rank == 0:
+                full_value = full_sd[name].detach()
+                for destination in range(1, world_size):
+                    destination_shard = _kt_fsdp2_cpu_shard(full_value, destination, world_size)
+                    destination_shard = destination_shard.to(dtype=target_dtype).contiguous()
+                    if destination_shard.numel() != 0:
+                        dist.send(destination_shard, dst=destination, group=cpu_group)
+
+                local_cpu = _kt_fsdp2_cpu_shard(full_value, 0, world_size)
+                local_cpu = local_cpu.to(dtype=target_dtype).contiguous()
+            else:
+                local_shape = list(global_shape)
+                chunk_size = (global_shape[0] + world_size - 1) // world_size
+                start = min(rank * chunk_size, global_shape[0])
+                local_shape[0] = min(chunk_size, global_shape[0] - start)
+                local_cpu = torch.empty(local_shape, dtype=target_dtype, device="cpu")
+                if local_cpu.numel() != 0:
+                    dist.recv(local_cpu, src=0, group=cpu_group)
+
+            local_tensor = local_cpu.to(accelerator.device)
+            loaded_state[name] = DTensor.from_local(
+                local_tensor,
+                device_mesh=mesh,
+                placements=placements,
+                run_check=False,
+                shape=torch.Size(global_shape),
+                stride=global_stride,
+            )
+            dtype_name = str(local_tensor.dtype)
+            local_tensor_bytes = local_tensor.numel() * local_tensor.element_size()
+            local_dtype_bytes[dtype_name] = local_dtype_bytes.get(dtype_name, 0) + local_tensor_bytes
+            local_max_tensor_bytes = max(local_max_tensor_bytes, local_tensor_bytes)
+            if rank == 0:
+                global_tensor_bytes = sharded_value.numel() * sharded_value.element_size()
+                global_dtype_bytes[dtype_name] = global_dtype_bytes.get(dtype_name, 0) + global_tensor_bytes
+                global_max_tensor_bytes = max(global_max_tensor_bytes, global_tensor_bytes)
+
+        inventory = [None] * world_size
+        dist.all_gather_object(
+            inventory,
+            {"by_dtype": local_dtype_bytes, "max_tensor_bytes": local_max_tensor_bytes},
+            group=cpu_group,
+        )
+        if rank == 0:
+            logging.getLogger(__name__).info(
+                "KT INT8 streaming FSDP2 state inventory: global_by_dtype=%s, global_max_tensor_bytes=%d, "
+                "local_by_rank=%s",
+                global_dtype_bytes,
+                global_max_tensor_bytes,
+                inventory,
+            )
+    finally:
+        if owns_cpu_group:
+            dist.destroy_process_group(cpu_group)
+
+    model.load_state_dict(loaded_state, assign=True)
+    loaded_requires_grad = {
+        name: parameter.requires_grad for name, parameter in model.named_parameters(remove_duplicate=False)
+    }
+    if loaded_requires_grad != parameter_requires_grad:
+        raise RuntimeError("KT INT8 streaming FSDP2 loading changed Parameter requires_grad ownership.")
+    return model
+
+
 def patch_fsdp2_kt_parameter_identity(model_args: "ModelArguments") -> None:
     if not model_args.use_kt or model_args.kt_expert_weight_format != "int8":
         return
@@ -247,12 +505,20 @@ def patch_fsdp2_kt_parameter_identity(model_args: "ModelArguments") -> None:
         _validate_shardable_frozen_params(model, allowed_ignored_params)
 
         kt_parameter_ids = {id(param) for param in explicit_kt_params}
+        rank_zero_only_names = frozenset(
+            name for name, param in model.named_parameters(remove_duplicate=False) if id(param) in kt_parameter_ids
+        )
 
         import torch.distributed.fsdp as torch_fsdp
 
         original_fully_shard = torch_fsdp.fully_shard
+        original_load_full_state_dict = fsdp_utils.fsdp2_load_full_state_dict
         if "ignored_params" not in inspect.signature(original_fully_shard).parameters:
             raise RuntimeError("This PyTorch fully_shard does not support ignored_params.")
+        if accelerate_utils.fsdp2_load_full_state_dict is not original_load_full_state_dict:
+            raise RuntimeError(
+                "accelerate.utils.fsdp2_load_full_state_dict does not match accelerate.utils.fsdp_utils."
+            )
 
         fully_shard_calls = 0
 
@@ -263,8 +529,20 @@ def patch_fsdp2_kt_parameter_identity(model_args: "ModelArguments") -> None:
             kwargs["ignored_params"] = allowed_ignored_params
             return original_fully_shard(module, *args, **kwargs)
 
+        @wraps(_kt_fsdp2_streaming_load_full_state_dict)
+        def streaming_load_full_state_dict(accelerator, model, full_sd, cpu_offload=False):
+            return _kt_fsdp2_streaming_load_full_state_dict(
+                accelerator,
+                model,
+                full_sd,
+                cpu_offload,
+                rank_zero_only_names=rank_zero_only_names,
+            )
+
         with _FSDP2_PATCH_LOCK:
             torch_fsdp.fully_shard = selective_fully_shard
+            fsdp_utils.fsdp2_load_full_state_dict = streaming_load_full_state_dict
+            accelerate_utils.fsdp2_load_full_state_dict = streaming_load_full_state_dict
             try:
                 with warnings.catch_warnings():
                     warnings.filterwarnings(
@@ -275,6 +553,8 @@ def patch_fsdp2_kt_parameter_identity(model_args: "ModelArguments") -> None:
                         prepared_model = original_prepare(accelerator, model)
             finally:
                 torch_fsdp.fully_shard = original_fully_shard
+                fsdp_utils.fsdp2_load_full_state_dict = original_load_full_state_dict
+                accelerate_utils.fsdp2_load_full_state_dict = original_load_full_state_dict
 
         if fully_shard_calls == 0:
             raise RuntimeError("Accelerate fsdp2_prepare_model did not call fully_shard.")
