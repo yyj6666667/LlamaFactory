@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import FineGrainedFP8Config
 from transformers.integrations.finegrained_fp8 import Fp8Dequantize
 
 from llamafactory.model.model_utils.quantization import (
@@ -92,6 +93,27 @@ def test_fp8_dequantization_casts_unquantized_weight_to_configured_dtype():
     )
 
     assert result["weight"][0].dtype == torch.bfloat16
+
+
+def test_fp8_dequantization_dtype_survives_checkpoint_config_merge():
+    loading_config = FineGrainedFP8Config(dequantize=True, weight_block_size=(2, 3))
+    checkpoint_config = FineGrainedFP8Config(weight_block_size=(2, 3))
+    assert not hasattr(checkpoint_config, "_llamafactory_dequantization_dtype")
+
+    _patch_fp8_partial_block_dequantization(loading_config, torch.bfloat16)
+    for name, value in loading_config.get_loading_attributes().items():
+        setattr(checkpoint_config, name, value)
+
+    quantized = torch.ones((4, 6), dtype=torch.float8_e4m3fn)
+    scales = torch.ones((2, 2), dtype=torch.float32)
+    quantizer = SimpleNamespace(quantization_config=checkpoint_config)
+    result = Fp8Dequantize(quantizer).convert(
+        {"weight$": [quantized], "weight_scale_inv": [scales]},
+        full_layer_name="weight",
+    )
+
+    assert checkpoint_config._llamafactory_dequantization_dtype == torch.bfloat16
+    assert result["weight"].dtype == torch.bfloat16
 
 
 def test_fp8_partial_block_dequantization_rejects_wrong_scale_shape():

@@ -69,8 +69,36 @@ def _patch_deepseek_remote_code_compatibility() -> None:
     import_utils.is_torch_fx_available = is_torch_available
 
 
-def _patch_fp8_partial_block_dequantization() -> None:
+def _patch_fp8_partial_block_dequantization(
+    quantization_config: Any | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> None:
+    from transformers import FineGrainedFP8Config
     from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+
+    if (quantization_config is None) != (output_dtype is None):
+        raise ValueError("`quantization_config` and `output_dtype` must be provided together.")
+
+    if quantization_config is not None:
+        if not isinstance(quantization_config, FineGrainedFP8Config):
+            raise TypeError("`quantization_config` must be a FineGrainedFP8Config.")
+
+        quantization_config._llamafactory_dequantization_dtype = output_dtype
+
+    if not getattr(FineGrainedFP8Config, "_llamafactory_loading_dtype_support", False):
+        original_get_loading_attributes = FineGrainedFP8Config.get_loading_attributes
+
+        @wraps(original_get_loading_attributes)
+        def get_loading_attributes(self):
+            loading_attributes = dict(original_get_loading_attributes(self))
+            configured_dtype = getattr(self, "_llamafactory_dequantization_dtype", None)
+            if configured_dtype is not None:
+                loading_attributes["_llamafactory_dequantization_dtype"] = configured_dtype
+
+            return loading_attributes
+
+        FineGrainedFP8Config.get_loading_attributes = get_loading_attributes
+        FineGrainedFP8Config._llamafactory_loading_dtype_support = True
 
     if getattr(Fp8Dequantize, "_llamafactory_partial_block_support", False):
         return
@@ -236,11 +264,10 @@ def configure_quantization(
             )
             if is_kt_int8_deepseek:
                 _patch_deepseek_remote_code_compatibility()
-                _patch_fp8_partial_block_dequantization()
 
             quant_config = FineGrainedFP8Config(dequantize=True)
             if is_kt_int8_deepseek:
-                quant_config._llamafactory_dequantization_dtype = torch.bfloat16
+                _patch_fp8_partial_block_dequantization(quant_config, torch.bfloat16)
 
             init_kwargs["quantization_config"] = quant_config
             init_kwargs["ignore_mismatched_sizes"] = True
