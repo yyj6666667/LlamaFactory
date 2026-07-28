@@ -245,9 +245,16 @@ def _validate_deepseek_fsdp2_parameter_ownership(
     explicit_kt_params: set[torch.nn.Parameter],
     configured_params: set[torch.nn.Parameter],
 ) -> dict[int, str]:
-    if configured_params:
+    unexpected_configured_params = configured_params - explicit_kt_params
+    if unexpected_configured_params:
+        unexpected_names = sorted(
+            name
+            for name, parameter in model.named_parameters(remove_duplicate=False)
+            if parameter in unexpected_configured_params
+        )
         raise RuntimeError(
-            "KT DeepSeek-V3.1 FSDP2 only permits KT expert parameters to be ignored; remove `fsdp_ignored_modules`."
+            "KT DeepSeek-V3.1 FSDP2 only permits explicit KT expert parameters to be ignored; "
+            f"configured non-KT parameters: {unexpected_names}."
         )
 
     ignored_ids = {id(param) for param in explicit_kt_params}

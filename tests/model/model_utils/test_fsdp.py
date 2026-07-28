@@ -22,6 +22,7 @@ from llamafactory.model.model_utils.fsdp import (
     _collect_kt_fsdp_ignored_params,
     _kt_fsdp2_streaming_load_full_state_dict,
     _preserve_parameter_identity_on_conversion,
+    _validate_deepseek_fsdp2_parameter_ownership,
     patch_fsdp2_kt_parameter_identity,
 )
 
@@ -319,6 +320,43 @@ def test_only_explicit_kt_expert_subtree_is_ignored():
     assert model.embedding.weight not in ignored
     assert model.moe.gate.weight not in ignored
     assert model.moe.shared_expert.weight not in ignored
+
+
+@pytest.mark.parametrize("configured_mode", ["none", "subset", "all"])
+def test_deepseek_ownership_accepts_accelerate_registered_kt_experts(configured_mode):
+    model = _KTModel()
+    explicit_kt_params = _collect_kt_fsdp_ignored_params(model)
+    if configured_mode == "none":
+        configured_params = set()
+    elif configured_mode == "subset":
+        configured_params = {next(iter(explicit_kt_params))}
+    else:
+        configured_params = set(explicit_kt_params)
+
+    ownership = _validate_deepseek_fsdp2_parameter_ownership(
+        model,
+        [("moe", model.moe)],
+        explicit_kt_params,
+        configured_params,
+    )
+
+    assert id(model.moe.gate.weight) in ownership
+    assert id(model.moe.shared_expert.weight) in ownership
+    assert all(id(parameter) not in ownership for parameter in explicit_kt_params)
+
+
+def test_deepseek_ownership_rejects_configured_non_kt_parameter():
+    model = _KTModel()
+    explicit_kt_params = _collect_kt_fsdp_ignored_params(model)
+    configured_params = explicit_kt_params | {model.user_ignored.weight}
+
+    with pytest.raises(RuntimeError, match="configured non-KT parameters.*user_ignored.weight"):
+        _validate_deepseek_fsdp2_parameter_ownership(
+            model,
+            [("moe", model.moe)],
+            explicit_kt_params,
+            configured_params,
+        )
 
 
 def test_streaming_loader_shards_even_and_uneven_tensors_and_preserves_rank_ownership(tmp_path):
