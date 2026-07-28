@@ -1,6 +1,7 @@
 ### model
 model_name_or_path: /mnt/data/models/DeepSeek-V3.1
 trust_remote_code: true
+model_max_length: 1152
 
 ### method
 stage: sft

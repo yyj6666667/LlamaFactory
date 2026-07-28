@@ -20,10 +20,23 @@ from transformers import FineGrainedFP8Config
 from transformers.integrations.finegrained_fp8 import Fp8Dequantize
 
 from llamafactory.model.model_utils.quantization import (
+    _cap_kt_deepseek_rope_cache,
     _patch_deepseek_remote_code_compatibility,
     _patch_fp8_partial_block_dequantization,
     configure_quantization,
 )
+
+
+def test_kt_deepseek_rope_cache_keeps_original_context_capacity():
+    config = SimpleNamespace(
+        max_position_embeddings=163840,
+        rope_scaling={"original_max_position_embeddings": 4096},
+    )
+    model_args = SimpleNamespace(model_max_length=1152)
+
+    _cap_kt_deepseek_rope_cache(config, model_args)
+
+    assert config.max_position_embeddings == 4096
 
 
 def test_fp8_partial_block_dequantization():

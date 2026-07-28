@@ -69,6 +69,29 @@ def _patch_deepseek_remote_code_compatibility() -> None:
     import_utils.is_torch_fx_available = is_torch_available
 
 
+def _cap_kt_deepseek_rope_cache(config: "PretrainedConfig", model_args: "ModelArguments") -> None:
+    requested_length = getattr(model_args, "model_max_length", None)
+    current_length = getattr(config, "max_position_embeddings", None)
+    if requested_length is None or current_length is None:
+        return
+
+    rope_scaling = getattr(config, "rope_scaling", None)
+    original_length = (
+        rope_scaling.get("original_max_position_embeddings", requested_length)
+        if isinstance(rope_scaling, dict)
+        else requested_length
+    )
+    cache_length = max(int(requested_length), int(original_length))
+    if cache_length >= int(current_length):
+        return
+
+    config.max_position_embeddings = cache_length
+    logger.info_rank0(
+        f"Capping DeepSeek KT RoPE cache from {current_length} to {cache_length} positions "
+        f"for model_max_length={requested_length}."
+    )
+
+
 def _patch_fp8_partial_block_dequantization(
     quantization_config: Any | None = None,
     output_dtype: torch.dtype | None = None,
@@ -264,6 +287,7 @@ def configure_quantization(
             )
             if is_kt_int8_deepseek:
                 _patch_deepseek_remote_code_compatibility()
+                _cap_kt_deepseek_rope_cache(config, model_args)
 
             quant_config = FineGrainedFP8Config(dequantize=True)
             if is_kt_int8_deepseek:
