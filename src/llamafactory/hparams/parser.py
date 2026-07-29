@@ -140,6 +140,22 @@ def _validate_kt_activation_policy_source(model_args: "ModelArguments", explicit
         )
 
 
+def _get_runtime_model_max_length(
+    data_args: "DataArguments",
+    training_args: "TrainingArguments",
+    finetuning_args: "FinetuningArguments",
+) -> int:
+    r"""Return the largest tensor length produced by the SFT data path."""
+    model_max_length = data_args.cutoff_len
+    if finetuning_args.stage == "sft" and training_args.do_train:
+        if data_args.packing:
+            model_max_length += 1
+
+        model_max_length = ((model_max_length + 7) // 8) * 8
+
+    return model_max_length
+
+
 def _parse_args(
     parser: "HfArgumentParser", args: dict[str, Any] | list[str] | None = None, allow_extra_keys: bool = False
 ) -> tuple[Any]:
@@ -566,10 +582,10 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
     elif training_args.fp16:
         model_args.compute_dtype = torch.float16
 
-    model_args.device_map = {"": get_current_device()}
-    model_args.model_max_length = data_args.cutoff_len
-    model_args.block_diag_attn = data_args.neat_packing
     data_args.packing = data_args.packing if data_args.packing is not None else finetuning_args.stage == "pt"
+    model_args.device_map = {"": get_current_device()}
+    model_args.model_max_length = _get_runtime_model_max_length(data_args, training_args, finetuning_args)
+    model_args.block_diag_attn = data_args.neat_packing
 
     # Log on each process the small summary
     logger.info(

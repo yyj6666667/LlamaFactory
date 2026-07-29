@@ -20,7 +20,7 @@ import yaml
 
 from llamafactory.hparams import model_args as model_args_module
 from llamafactory.hparams.model_args import ModelArguments
-from llamafactory.hparams.parser import _validate_kt_activation_policy_source
+from llamafactory.hparams.parser import _get_runtime_model_max_length, _validate_kt_activation_policy_source
 
 
 def _finetuning_args(**kwargs):
@@ -63,6 +63,31 @@ def test_deepseek_int8_example_is_two_gpu_acceptance_config():
     assert (config["cutoff_len"], config["per_device_train_batch_size"]) == (1024, 1)
     assert (config["gradient_accumulation_steps"], config["max_steps"]) == (1, 3)
     assert "model_max_length" not in config
+
+
+@pytest.mark.parametrize(
+    ("cutoff_len", "packing", "do_train", "expected"),
+    [
+        (1023, True, True, 1024),
+        (1023, False, True, 1024),
+        (1024, False, True, 1024),
+        (1025, False, True, 1032),
+        (1023, True, False, 1023),
+    ],
+)
+def test_sft_runtime_capacity_covers_packing_and_collator_padding(
+    cutoff_len: int,
+    packing: bool,
+    do_train: bool,
+    expected: int,
+):
+    capacity = _get_runtime_model_max_length(
+        SimpleNamespace(cutoff_len=cutoff_len, packing=packing),
+        SimpleNamespace(do_train=do_train),
+        SimpleNamespace(stage="sft"),
+    )
+
+    assert capacity == expected
 
 
 def test_int8_config_is_forwarded_from_single_yaml_entry(monkeypatch: pytest.MonkeyPatch):
