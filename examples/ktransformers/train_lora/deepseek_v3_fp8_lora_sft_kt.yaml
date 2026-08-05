@@ -1,0 +1,62 @@
+# Only supported launch command for this acceptance path:
+# CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
+#     --config_file examples/ktransformers/accelerate/fsdp2_kt_2gpu.yaml \
+#     src/train.py examples/ktransformers/train_lora/deepseek_v3_fp8_lora_sft_kt.yaml
+
+### model
+model_name_or_path: /mnt/data/models/DeepSeek-V3.1
+trust_remote_code: false
+flash_attn: sdpa
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0
+lora_target: all
+pure_bf16: true
+
+### dataset
+dataset: identity, alpaca_en_demo
+template: deepseek3
+cutoff_len: 1024
+max_samples: 64
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+packing: true
+neat_packing: true
+
+### output
+output_dir: saves/KT_FP8_LoRA_deepseekV3
+logging_steps: 1
+save_strategy: "no"
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-4
+max_steps: 3
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+fp8: false  # GPU compute remains BF16; only KT routed-expert storage is FP8.
+ddp_timeout: 180000000
+
+### ktransformers
+use_kt: true
+kt_expert_weight_format: fp8
+kt_backend: auto
+kt_num_threads: 64
+kt_tp_enabled: true
+kt_threadpool_count: 2
+kt_num_gpu_experts: 0
+kt_share_backward_bb: true
+kt_force_fused_expert_lora: true
+activation_policy: {cpu: retain, gpu: recompute}

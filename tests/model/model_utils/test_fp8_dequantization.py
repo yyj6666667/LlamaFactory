@@ -179,3 +179,22 @@ def test_kt_int8_bf16_cache_skips_online_fp8_dequantization():
     assert "quantization_config" not in init_kwargs
     assert "ignore_mismatched_sizes" not in init_kwargs
     assert config.max_position_embeddings == 1024
+
+
+def test_kt_native_fp8_still_dequantizes_non_routed_modules_to_bf16():
+    config = SimpleNamespace(model_type="deepseek_v3", quantization_config={"quant_method": "fp8"})
+    model_args = SimpleNamespace(
+        quantization_bit=None,
+        use_kt=True,
+        kt_weight_path="/models/deepseek-v31-fp8",
+        kt_non_expert_weight_path=None,
+        kt_expert_weight_format="fp8",
+    )
+    init_kwargs = {}
+
+    configure_quantization(config, None, model_args, True, init_kwargs)
+
+    quantization_config = init_kwargs["quantization_config"]
+    assert quantization_config.dequantize is True
+    assert quantization_config._llamafactory_dequantization_dtype == torch.bfloat16
+    assert init_kwargs["ignore_mismatched_sizes"] is True

@@ -861,7 +861,7 @@ def _kt_fsdp2_streaming_load_full_state_dict(
 
 
 def patch_fsdp2_kt_parameter_identity(model_args: "ModelArguments") -> None:
-    if not model_args.use_kt or model_args.kt_expert_weight_format != "int8":
+    if not model_args.use_kt or model_args.kt_expert_weight_format not in {"int8", "fp8"}:
         return
 
     import accelerate

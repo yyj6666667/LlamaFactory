@@ -65,6 +65,41 @@ def test_deepseek_int8_example_is_two_gpu_acceptance_config():
     assert "model_max_length" not in config
 
 
+def test_deepseek_fp8_example_preserves_only_routed_expert_storage():
+    example_path = (
+        Path(__file__).parents[2]
+        / "examples"
+        / "ktransformers"
+        / "train_lora"
+        / "deepseek_v3_fp8_lora_sft_kt.yaml"
+    )
+    example_text = example_path.read_text()
+    config = yaml.safe_load(example_text)
+
+    assert config["model_name_or_path"] == "/mnt/data/models/DeepSeek-V3.1"
+    assert config["kt_expert_weight_format"] == "fp8"
+    assert "kt_weight_path" not in config
+    assert "kt_non_expert_weight_path" not in config
+    assert config["bf16"] is True
+    assert config["fp8"] is False
+    assert config["activation_policy"] == {"cpu": "retain", "gpu": "recompute"}
+    assert (
+        "--config_file examples/ktransformers/accelerate/fsdp2_kt_2gpu.yaml" in example_text
+    )
+
+    accelerate_path = (
+        Path(__file__).parents[2]
+        / "examples"
+        / "ktransformers"
+        / "accelerate"
+        / "fsdp2_kt_2gpu.yaml"
+    )
+    accelerate_config = yaml.safe_load(accelerate_path.read_text())
+    assert accelerate_config["distributed_type"] == "FSDP"
+    assert accelerate_config["fsdp_config"]["fsdp_version"] == 2
+    assert accelerate_config["num_processes"] == 2
+
+
 @pytest.mark.parametrize(
     ("cutoff_len", "packing", "do_train", "expected"),
     [
@@ -343,3 +378,69 @@ def test_default_lifecycle_preserves_existing_kt_configs():
 
     assert model_args.kt_expert_weight_format is None
     assert config["kt_weight_lifecycle"] == "persistent"
+
+
+def test_fp8_uses_model_path_and_publishes_single_authoritative_config(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(model_args_module.os, "environ", {})
+    monkeypatch.setattr(
+        model_args_module,
+        "_get_kt_activation_checkpoint_context_fn",
+        lambda: object(),
+    )
+    model_args = ModelArguments(
+        model_name_or_path="/models/deepseek-v31-fp8",
+        use_kt=True,
+        kt_expert_weight_format="fp8",
+        activation_policy={"cpu": "retain", "gpu": "recompute"},
+    )
+    training_args = SimpleNamespace(
+        bf16=True,
+        fp8=False,
+        gradient_checkpointing=False,
+        gradient_checkpointing_kwargs=None,
+        hf_kt_config=SimpleNamespace(_kt_config={}),
+        accelerator_config=SimpleNamespace(kt_config=None),
+    )
+
+    model_args.apply_kt_config(
+        _finetuning_args(lora_rank=16, lora_alpha=32, lora_dropout=0.125), training_args, 1024
+    )
+
+    config = training_args.hf_kt_config._kt_config
+    assert model_args.kt_weight_path == "/models/deepseek-v31-fp8"
+    assert config["kt_weight_path"] == "/models/deepseek-v31-fp8"
+    assert config["kt_expert_weight_format"] == "fp8"
+    assert config["kt_backend"] == "auto"
+    assert config["kt_num_gpu_experts"] == 0
+    assert config["kt_share_backward_bb"] is True
+    assert config["kt_lora_dropout"] == pytest.approx(0.125)
+    assert "kt_non_expert_weight_path" not in config
+    assert model_args_module.os.environ["ACCELERATE_KT_EXPERT_WEIGHT_FORMAT"] == "fp8"
+    assert model_args_module.os.environ["ACCELERATE_KT_LORA_DROPOUT"] == "0.125"
+    assert training_args.accelerator_config.kt_config["kt_config"]["kt_lora_dropout"] == pytest.approx(0.125)
+
+
+@pytest.mark.parametrize(
+    ("training_kwargs", "match"),
+    [
+        ({"bf16": False, "fp8": False}, "requires `bf16: true`"),
+        ({"bf16": True, "fp8": True}, "controls CPU routed-expert storage"),
+    ],
+)
+def test_fp8_rejects_compute_precision_conflicts(training_kwargs: dict, match: str):
+    model_args = ModelArguments(
+        model_name_or_path="/models/deepseek-v31-fp8",
+        use_kt=True,
+        kt_expert_weight_format="fp8",
+        activation_policy={"cpu": "retain", "gpu": "recompute"},
+    )
+    training_args = SimpleNamespace(
+        **training_kwargs,
+        gradient_checkpointing=False,
+        gradient_checkpointing_kwargs=None,
+        hf_kt_config=SimpleNamespace(_kt_config={}),
+        accelerator_config=SimpleNamespace(kt_config=None),
+    )
+
+    with pytest.raises(ValueError, match=match):
+        model_args.apply_kt_config(_finetuning_args(), training_args, 1024)

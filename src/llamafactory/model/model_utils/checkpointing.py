@@ -41,13 +41,17 @@ logger = logging.get_logger(__name__)
 
 
 def validate_kt_deepseek_v3_native_config(config: Any, model_args: "ModelArguments") -> None:
-    r"""Validate the production model-code contract before loading DeepSeek-V3 INT8 weights."""
-    if not model_args.use_kt or model_args.kt_expert_weight_format != "int8":
+    r"""Validate the production model-code contract before loading pre-quantized DeepSeek-V3 experts."""
+    if not model_args.use_kt or model_args.kt_expert_weight_format not in {"int8", "fp8"}:
+        return
+
+    format_label = model_args.kt_expert_weight_format.upper()
+    if model_args.kt_expert_weight_format == "fp8" and getattr(config, "model_type", None) != "deepseek_v3":
         return
 
     if model_args.trust_remote_code:
         raise RuntimeError(
-            "KTransformers DeepSeek-V3 INT8 LoRA must use the native Transformers implementation "
+            f"KTransformers DeepSeek-V3 {format_label} LoRA must use the native Transformers implementation "
             "with `trust_remote_code: false`."
         )
 
@@ -58,7 +62,7 @@ def validate_kt_deepseek_v3_native_config(config: Any, model_args: "ModelArgumen
         or not config_type.__module__.startswith("transformers.models.deepseek_v3.")
     ):
         raise RuntimeError(
-            "KTransformers INT8 LoRA currently requires the native "
+            f"KTransformers {format_label} LoRA currently requires the native "
             "`transformers.models.deepseek_v3.DeepseekV3Config`; "
             f"got {config_type.__module__}.{config_type.__name__}."
         )
@@ -74,30 +78,41 @@ def validate_kt_deepseek_v3_native_config(config: Any, model_args: "ModelArgumen
         if getattr(config, name, None) != value
     }
     if mismatches:
-        raise RuntimeError(f"DeepSeek-V3.1 INT8 model structure does not match the production contract: {mismatches}.")
+        raise RuntimeError(
+            f"DeepSeek-V3.1 {format_label} model structure does not match the production contract: {mismatches}."
+        )
 
 
 def _validate_kt_deepseek_v3_checkpointing(model: "PreTrainedModel", model_args: "ModelArguments") -> None:
-    if not model_args.use_kt or model_args.kt_expert_weight_format != "int8":
+    if not model_args.use_kt or model_args.kt_expert_weight_format not in {"int8", "fp8"}:
+        return
+
+    format_label = model_args.kt_expert_weight_format.upper()
+    if (
+        model_args.kt_expert_weight_format == "fp8"
+        and getattr(getattr(model, "config", None), "model_type", None) != "deepseek_v3"
+    ):
         return
 
     try:
         from transformers.modeling_layers import GradientCheckpointingLayer
     except (ImportError, ModuleNotFoundError) as exc:
         raise RuntimeError(
-            "KTransformers DeepSeek-V3 INT8 LoRA requires a Transformers build with `GradientCheckpointingLayer`."
+            f"KTransformers DeepSeek-V3 {format_label} LoRA requires a Transformers build with "
+            "`GradientCheckpointingLayer`."
         ) from exc
 
     model_type = type(model)
     if not model_type.__module__.startswith("transformers.models.deepseek_v3."):
         raise RuntimeError(
-            f"DeepSeek-V3 INT8 loaded non-native model code: {model_type.__module__}.{model_type.__name__}."
+            f"DeepSeek-V3 {format_label} loaded non-native model code: "
+            f"{model_type.__module__}.{model_type.__name__}."
         )
 
     base_model = getattr(model, "model", None)
     layers = getattr(base_model, "layers", None)
     if not isinstance(layers, torch.nn.ModuleList) or len(layers) != 61:
-        raise RuntimeError("DeepSeek-V3.1 INT8 requires exactly 61 native decoder layers.")
+        raise RuntimeError(f"DeepSeek-V3.1 {format_label} requires exactly 61 native decoder layers.")
 
     invalid_layer_types = [
         index for index, layer in enumerate(layers) if not isinstance(layer, GradientCheckpointingLayer)

@@ -267,16 +267,16 @@ def configure_quantization(
         if quant_method == QuantizationMethod.FP8:
             from transformers import FineGrainedFP8Config
 
-            is_kt_int8_deepseek = (
+            is_kt_prequantized_deepseek = (
                 getattr(model_args, "use_kt", False)
-                and getattr(model_args, "kt_expert_weight_format", None) == "int8"
+                and getattr(model_args, "kt_expert_weight_format", None) in {"int8", "fp8"}
                 and getattr(config, "model_type", None) == "deepseek_v3"
             )
-            if is_kt_int8_deepseek:
+            if is_kt_prequantized_deepseek:
                 _cap_kt_deepseek_rope_cache(config, model_args)
 
             quant_config = FineGrainedFP8Config(dequantize=True)
-            if is_kt_int8_deepseek:
+            if is_kt_prequantized_deepseek:
                 _patch_fp8_partial_block_dequantization(quant_config, torch.bfloat16)
 
             init_kwargs["quantization_config"] = quant_config
