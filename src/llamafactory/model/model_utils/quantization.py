@@ -129,16 +129,19 @@ def configure_quantization(
 
         if quant_method == QuantizationMethod.FP8:
             if _is_kt_int8_non_expert_cache_loading(model_args):
+                if model_args.quantization_bit is not None:
+                    raise ValueError("`quantization_bit` cannot be combined with KT INT8/BF16 weight caches.")
                 logger.info_rank0(
                     "Skipping the source FP8 quantizer because KT will load validated BF16 non-expert and INT8 "
                     "routed-expert caches."
                 )
-            else:
-                from transformers import FineGrainedFP8Config
+                return
 
-                quant_config = FineGrainedFP8Config(dequantize=True)
-                init_kwargs["quantization_config"] = quant_config
-                init_kwargs["ignore_mismatched_sizes"] = True
+            from transformers import FineGrainedFP8Config
+
+            quant_config = FineGrainedFP8Config(dequantize=True)
+            init_kwargs["quantization_config"] = quant_config
+            init_kwargs["ignore_mismatched_sizes"] = True
 
         if quant_method == QuantizationMethod.GPTQ:
             check_version("gptqmodel>=2.0.0", mandatory=True)

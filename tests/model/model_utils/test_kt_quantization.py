@@ -14,6 +14,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from llamafactory.model.model_utils.quantization import configure_quantization
 
 
@@ -41,11 +43,40 @@ def test_kt_int8_cache_skips_source_fp8_dequantizer(monkeypatch):
     assert "ignore_mismatched_sizes" not in init_kwargs
 
 
-def test_standard_fp8_loading_keeps_source_dequantizer(monkeypatch):
+def test_kt_int8_live_config_skips_source_fp8_dequantizer(monkeypatch):
+    from transformers.integrations.kt import HfTrainerKTConfig, unset_kt_config
+
+    monkeypatch.delenv("ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH", raising=False)
+    live_config = HfTrainerKTConfig(
+        {
+            "enabled": True,
+            "kt_expert_weight_format": "int8",
+            "kt_non_expert_weight_path": "/tmp/nonexpert-cache",
+            "kt_skip_expert_loading": True,
+        }
+    )
+    init_kwargs = {}
+    try:
+        configure_quantization(
+            _fp8_config(),
+            tokenizer=None,
+            model_args=SimpleNamespace(use_kt=True, quantization_bit=None),
+            is_trainable=True,
+            init_kwargs=init_kwargs,
+        )
+    finally:
+        unset_kt_config()
+
+    assert live_config.kt_non_expert_weight_path == "/tmp/nonexpert-cache"
+    assert "quantization_config" not in init_kwargs
+
+
+def test_kt_int8_without_non_expert_cache_keeps_source_dequantizer(monkeypatch):
     from transformers.integrations import kt
 
-    monkeypatch.setattr(kt, "is_kt_int8_expert_loading_enabled", lambda: False)
-    monkeypatch.setenv("ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH", "/tmp/nonexpert-cache")
+    monkeypatch.setattr(kt, "is_kt_int8_expert_loading_enabled", lambda: True)
+    monkeypatch.setattr(kt, "_get_kt_config", lambda: None)
+    monkeypatch.delenv("ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH", raising=False)
     init_kwargs = {}
 
     configure_quantization(
@@ -58,3 +89,20 @@ def test_standard_fp8_loading_keeps_source_dequantizer(monkeypatch):
 
     assert init_kwargs["quantization_config"].dequantize is True
     assert init_kwargs["ignore_mismatched_sizes"] is True
+
+
+def test_kt_int8_cache_rejects_on_the_fly_quantization(monkeypatch):
+    from transformers.integrations import kt
+
+    monkeypatch.setattr(kt, "is_kt_int8_expert_loading_enabled", lambda: True)
+    monkeypatch.setattr(kt, "_get_kt_config", lambda: None)
+    monkeypatch.setenv("ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH", "/tmp/nonexpert-cache")
+
+    with pytest.raises(ValueError, match="quantization_bit.*KT INT8/BF16"):
+        configure_quantization(
+            _fp8_config(),
+            tokenizer=None,
+            model_args=SimpleNamespace(use_kt=True, quantization_bit=4),
+            is_trainable=True,
+            init_kwargs={},
+        )
