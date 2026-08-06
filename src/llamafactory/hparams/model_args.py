@@ -733,6 +733,15 @@ class KTransformersArguments:
         hf_kt._kt_config = kernel_config
         hf_kt._llamafactory_authoritative = True
 
+        # Some values are consumed by Transformers while loading the model but
+        # are not KTConfig constructor arguments.  Keep them in the HF config
+        # and environment, but do not pass them to Accelerate's kernel plugin.
+        plugin_kernel_config = kernel_config
+        if "kt_non_expert_weight_path" in kernel_config:
+            plugin_kernel_config = {
+                key: value for key, value in kernel_config.items() if key != "kt_non_expert_weight_path"
+            }
+
         for key, env_key in env_mapping.items():
             value = kernel_config.get(key)
             if value is not None:
@@ -743,7 +752,7 @@ class KTransformersArguments:
             **training_plugin,
             **accelerator_plugin,
             "enabled": True,
-            "kt_config": kernel_config,
+            "kt_config": plugin_kernel_config,
         }
         if isinstance(accelerator_config, dict):
             accelerator_config["kt_config"] = plugin_config

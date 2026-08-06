@@ -161,6 +161,25 @@ def test_apply_kt_config_normalizes_existing_plugin_config():
     assert "kt_config" not in plugin_config["kt_config"]
 
 
+def test_apply_kt_config_keeps_transformers_only_values_out_of_kernel_plugin():
+    model_args = ModelArguments(model_name_or_path="dummy", use_kt=True, kt_cpu_activation="retain")
+    training_args = _training_args(
+        hf_kt_config=SimpleNamespace(
+            _kt_config={
+                "kt_expert_weight_format": "int8",
+                "kt_non_expert_weight_path": "/tmp/nonexpert-cache",
+            }
+        )
+    )
+
+    model_args.apply_kt_config(_finetuning_args(), training_args, model_max_length=1024)
+
+    assert training_args.hf_kt_config._kt_config["kt_non_expert_weight_path"] == "/tmp/nonexpert-cache"
+    plugin_kernel_config = training_args.accelerator_config.kt_config["kt_config"]
+    assert plugin_kernel_config["kt_expert_weight_format"] == "int8"
+    assert "kt_non_expert_weight_path" not in plugin_kernel_config
+
+
 def test_apply_kt_config_is_idempotent():
     model_args = ModelArguments(model_name_or_path="dummy", use_kt=True, kt_cpu_activation="retain")
     training_args = _training_args()
