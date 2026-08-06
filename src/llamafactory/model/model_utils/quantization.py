@@ -40,6 +40,26 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
+def _is_kt_int8_non_expert_cache_loading(model_args: "ModelArguments") -> bool:
+    """Whether KT replaces native FP8 loading with validated BF16 and INT8 caches."""
+    if not model_args.use_kt:
+        return False
+
+    try:
+        from transformers.integrations.kt import _get_kt_config, is_kt_int8_expert_loading_enabled
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+    if not is_kt_int8_expert_loading_enabled():
+        return False
+
+    kt_config = _get_kt_config()
+    cache_path = getattr(kt_config, "kt_non_expert_weight_path", None) if kt_config is not None else None
+    if cache_path is None:
+        cache_path = os.environ.get("ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH")
+    return bool(cache_path)
+
+
 def _get_quantization_dataset(tokenizer: "PreTrainedTokenizer", model_args: "ModelArguments") -> list[dict[str, Any]]:
     r"""Prepare the tokenized dataset to perform AutoGPTQ. Do not use tensor output for JSON serialization."""
     if os.path.isfile(model_args.export_quantization_dataset):
@@ -108,11 +128,17 @@ def configure_quantization(
             init_kwargs["ignore_mismatched_sizes"] = True
 
         if quant_method == QuantizationMethod.FP8:
-            from transformers import FineGrainedFP8Config
+            if _is_kt_int8_non_expert_cache_loading(model_args):
+                logger.info_rank0(
+                    "Skipping the source FP8 quantizer because KT will load validated BF16 non-expert and INT8 "
+                    "routed-expert caches."
+                )
+            else:
+                from transformers import FineGrainedFP8Config
 
-            quant_config = FineGrainedFP8Config(dequantize=True)
-            init_kwargs["quantization_config"] = quant_config
-            init_kwargs["ignore_mismatched_sizes"] = True
+                quant_config = FineGrainedFP8Config(dequantize=True)
+                init_kwargs["quantization_config"] = quant_config
+                init_kwargs["ignore_mismatched_sizes"] = True
 
         if quant_method == QuantizationMethod.GPTQ:
             check_version("gptqmodel>=2.0.0", mandatory=True)
