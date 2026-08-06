@@ -40,6 +40,8 @@ resume_from_checkpoint: null
 
 ### ktransformers
 use_kt: true
+# CPU AMX BF16/frozen INT8/FP8 only; omit for INT4, GPU, or Hybrid paths.
+# kt_cpu_activation: retain
 # Pair with examples/ktransformers/accelerate/fsdp2_kt_bf16.yaml for original BF16 checkpoints.
 # For pre-converted expert weights, uncomment kt_weight_path and use fsdp2_kt_int8.yaml or fsdp2_kt_int4.yaml.
 # kt_weight_path: /path/to/Qwen3-235B-A22B-Instruct-2507-AMXINT8

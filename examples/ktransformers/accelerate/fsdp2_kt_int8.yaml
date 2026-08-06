@@ -22,4 +22,3 @@ kt_config:
   kt_threadpool_count: 2
   kt_max_cache_depth: 2
   kt_share_backward_bb: true
-  lora_rank: 8
