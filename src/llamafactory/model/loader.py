@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
@@ -51,6 +52,27 @@ logger = logging.get_logger(__name__)
 class TokenizerModule(TypedDict):
     tokenizer: "PreTrainedTokenizer"
     processor: Optional["ProcessorMixin"]
+
+
+def _is_kt_text_only_qwen35_sft(
+    model: "PreTrainedModel", model_args: "ModelArguments", finetuning_args: "FinetuningArguments"
+) -> bool:
+    config = model.config
+    config_path = os.path.join(model_args.model_name_or_path, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            raw_config = json.load(config_file)
+    except (OSError, TypeError, ValueError):
+        return False
+
+    return (
+        model_args.use_kt
+        and finetuning_args.stage == "sft"
+        and finetuning_args.finetuning_type == "lora"
+        and getattr(config, "model_type", None) in {"qwen3_5", "qwen3_5_moe"}
+        and raw_config.get("image_token_id") is None
+        and raw_config.get("video_token_id") is None
+    )
 
 
 def _get_init_kwargs(model_args: "ModelArguments") -> dict[str, Any]:
@@ -197,12 +219,18 @@ def load_model(
     # Conv3D is not recommended when using torch 2.9.x
     if is_torch_version_greater_than("2.9.0") and not is_torch_version_greater_than("2.10.0"):
         if any(isinstance(m, torch.nn.Conv3d) for m in model.modules()):
-            raise ValueError(
-                "Unsupported torch version detected: torch 2.9.x with Conv3D. "
-                "This combination is known to cause severe performance regression. "
-                "Please downgrade torch to <2.9 or remove Conv3D. "
-                "See https://github.com/pytorch/pytorch/issues/166122"
-            )
+            if _is_kt_text_only_qwen35_sft(model, model_args, finetuning_args):
+                logger.warning_rank0(
+                    "Allowing torch 2.9.x Conv3D for KT text-only Qwen3.5 LoRA; "
+                    "the vision tower is frozen and only serves the FSDP dummy-image path."
+                )
+            else:
+                raise ValueError(
+                    "Unsupported torch version detected: torch 2.9.x with Conv3D. "
+                    "This combination is known to cause severe performance regression. "
+                    "Please downgrade torch to <2.9 or remove Conv3D. "
+                    "See https://github.com/pytorch/pytorch/issues/166122"
+                )
 
     if not is_trainable:
         model.requires_grad_(False)
