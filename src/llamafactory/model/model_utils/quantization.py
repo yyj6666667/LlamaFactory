@@ -28,6 +28,7 @@ from transformers.modeling_utils import is_fsdp_enabled
 
 from ...extras import logging
 from ...extras.constants import FILEEXT2TYPE, QuantizationMethod
+from ...extras.kt_cache import is_kt_int8_cache_requested
 from ...extras.misc import check_version, get_current_device
 
 
@@ -42,22 +43,7 @@ logger = logging.get_logger(__name__)
 
 def _is_kt_int8_non_expert_cache_loading(model_args: "ModelArguments") -> bool:
     """Whether KT replaces native FP8 loading with validated BF16 and INT8 caches."""
-    if not model_args.use_kt:
-        return False
-
-    try:
-        from transformers.integrations.kt import _get_kt_config, is_kt_int8_expert_loading_enabled
-    except (ImportError, ModuleNotFoundError):
-        return False
-
-    if not is_kt_int8_expert_loading_enabled():
-        return False
-
-    kt_config = _get_kt_config()
-    cache_path = getattr(kt_config, "kt_non_expert_weight_path", None) if kt_config is not None else None
-    if cache_path is None:
-        cache_path = os.environ.get("ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH")
-    return bool(cache_path)
+    return is_kt_int8_cache_requested(model_args)
 
 
 def _get_quantization_dataset(tokenizer: "PreTrainedTokenizer", model_args: "ModelArguments") -> list[dict[str, Any]]:

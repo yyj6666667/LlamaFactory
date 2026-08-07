@@ -29,6 +29,11 @@ from transformers import (
 from trl import AutoModelForCausalLMWithValueHead
 
 from ..extras import logging
+from ..extras.kt_cache import (
+    is_kt_int8_cache_requested,
+    prepare_kt_int8_cache_loading,
+    validate_kt_int8_loaded_model,
+)
 from ..extras.misc import count_parameters, skip_check_imports, try_download_model_from_other_hub
 from ..extras.packages import is_torch_version_greater_than
 from .adapter import init_adapter
@@ -175,6 +180,10 @@ def load_model(
         init_kwargs["pretrained_model_name_or_path"] = model_args.model_name_or_path
         init_kwargs["torch_dtype"] = "auto"
 
+        if is_kt_int8_cache_requested(model_args) and model_args.mixture_of_depths is not None:
+            raise ValueError("KT INT8 non-expert cache loading cannot be combined with mixture-of-depths conversion.")
+
+        kt_non_expert_cache = None
         if model_args.mixture_of_depths == "load":
             model = load_mod_pretrained_model(**init_kwargs)
         else:
@@ -188,9 +197,24 @@ def load_model(
                 load_class = AutoModelForCausalLM
 
             if model_args.train_from_scratch:
+                if is_kt_int8_cache_requested(model_args):
+                    raise ValueError("KT INT8 non-expert caches cannot be used with `train_from_scratch`.")
                 model = load_class.from_config(config, trust_remote_code=model_args.trust_remote_code)
             else:
-                model = load_class.from_pretrained(**init_kwargs)
+                kt_non_expert_cache = prepare_kt_int8_cache_loading(config, model_args, init_kwargs)
+                loaded = load_class.from_pretrained(**init_kwargs)
+                if kt_non_expert_cache is None:
+                    model = loaded
+                else:
+                    if not isinstance(loaded, tuple) or len(loaded) != 2:
+                        raise RuntimeError("Frozen Transformers did not return KT cache loading diagnostics.")
+                    model, loading_info = loaded
+                    validate_kt_int8_loaded_model(
+                        model,
+                        loading_info,
+                        kt_non_expert_cache,
+                        model_args.model_name_or_path,
+                    )
                 if getattr(model.config, "model_type", None) in ["qwen2_5_omni", "qwen3_omni_moe"]:
                     model = getattr(model, "thinker")
 

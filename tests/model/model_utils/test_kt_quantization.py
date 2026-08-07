@@ -23,18 +23,24 @@ def _fp8_config():
     return SimpleNamespace(quantization_config={"quant_method": "fp8", "bits": 8})
 
 
-def test_kt_int8_cache_skips_source_fp8_dequantizer(monkeypatch):
-    from transformers.integrations import kt
+def _model_args(**overrides):
+    values = {
+        "use_kt": True,
+        "quantization_bit": None,
+        "kt_non_expert_weight_path": "/tmp/nonexpert-cache",
+        "_kt_resolved_config": {"kt_expert_weight_format": "int8"},
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
-    monkeypatch.setattr(kt, "is_kt_int8_expert_loading_enabled", lambda: True)
-    monkeypatch.setattr(kt, "_get_kt_config", lambda: None)
-    monkeypatch.setenv("ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH", "/tmp/nonexpert-cache")
+
+def test_kt_int8_cache_skips_source_fp8_dequantizer():
     init_kwargs = {}
 
     configure_quantization(
         _fp8_config(),
         tokenizer=None,
-        model_args=SimpleNamespace(use_kt=True, quantization_bit=None),
+        model_args=_model_args(),
         is_trainable=True,
         init_kwargs=init_kwargs,
     )
@@ -43,46 +49,26 @@ def test_kt_int8_cache_skips_source_fp8_dequantizer(monkeypatch):
     assert "ignore_mismatched_sizes" not in init_kwargs
 
 
-def test_kt_int8_live_config_skips_source_fp8_dequantizer(monkeypatch):
-    from transformers.integrations.kt import HfTrainerKTConfig, unset_kt_config
-
-    monkeypatch.delenv("ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH", raising=False)
-    live_config = HfTrainerKTConfig(
-        {
-            "enabled": True,
-            "kt_expert_weight_format": "int8",
-            "kt_non_expert_weight_path": "/tmp/nonexpert-cache",
-            "kt_skip_expert_loading": True,
-        }
-    )
+def test_kt_int8_resolved_config_skips_source_fp8_dequantizer():
     init_kwargs = {}
-    try:
-        configure_quantization(
-            _fp8_config(),
-            tokenizer=None,
-            model_args=SimpleNamespace(use_kt=True, quantization_bit=None),
-            is_trainable=True,
-            init_kwargs=init_kwargs,
-        )
-    finally:
-        unset_kt_config()
+    configure_quantization(
+        _fp8_config(),
+        tokenizer=None,
+        model_args=_model_args(),
+        is_trainable=True,
+        init_kwargs=init_kwargs,
+    )
 
-    assert live_config.kt_non_expert_weight_path == "/tmp/nonexpert-cache"
     assert "quantization_config" not in init_kwargs
 
 
-def test_kt_int8_without_non_expert_cache_keeps_source_dequantizer(monkeypatch):
-    from transformers.integrations import kt
-
-    monkeypatch.setattr(kt, "is_kt_int8_expert_loading_enabled", lambda: True)
-    monkeypatch.setattr(kt, "_get_kt_config", lambda: None)
-    monkeypatch.delenv("ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH", raising=False)
+def test_kt_int8_without_non_expert_cache_keeps_source_dequantizer():
     init_kwargs = {}
 
     configure_quantization(
         _fp8_config(),
         tokenizer=None,
-        model_args=SimpleNamespace(use_kt=True, quantization_bit=None),
+        model_args=_model_args(kt_non_expert_weight_path=None),
         is_trainable=True,
         init_kwargs=init_kwargs,
     )
@@ -91,18 +77,12 @@ def test_kt_int8_without_non_expert_cache_keeps_source_dequantizer(monkeypatch):
     assert init_kwargs["ignore_mismatched_sizes"] is True
 
 
-def test_kt_int8_cache_rejects_on_the_fly_quantization(monkeypatch):
-    from transformers.integrations import kt
-
-    monkeypatch.setattr(kt, "is_kt_int8_expert_loading_enabled", lambda: True)
-    monkeypatch.setattr(kt, "_get_kt_config", lambda: None)
-    monkeypatch.setenv("ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH", "/tmp/nonexpert-cache")
-
+def test_kt_int8_cache_rejects_on_the_fly_quantization():
     with pytest.raises(ValueError, match="quantization_bit.*KT INT8/BF16"):
         configure_quantization(
             _fp8_config(),
             tokenizer=None,
-            model_args=SimpleNamespace(use_kt=True, quantization_bit=4),
+            model_args=_model_args(quantization_bit=4),
             is_trainable=True,
             init_kwargs={},
         )
