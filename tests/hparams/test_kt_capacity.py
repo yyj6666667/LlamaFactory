@@ -58,17 +58,23 @@ def test_kt_runtime_capacity_uses_internal_packed_cutoff():
     assert _get_kt_runtime_capacity(data_args, training_args, SimpleNamespace(stage="sft")) == 1024
 
 
-@pytest.mark.parametrize(("computed", "configured", "expected"), [(1024, "1152", 1152), (2048, "1024", 2048)])
-def test_kt_runtime_capacity_preserves_configured_headroom(monkeypatch, computed, configured, expected):
-    monkeypatch.setenv("ACCELERATE_KT_MODEL_MAX_LENGTH", configured)
+@pytest.mark.parametrize(("computed", "configured", "expected"), [(1024, 1152, 1152), (2048, 1024, 2048)])
+def test_kt_runtime_capacity_preserves_configured_headroom(computed, configured, expected):
     model_args = ModelArguments(model_name_or_path="dummy", use_kt=True)
-    config = model_args.get_kt_config_dict(SimpleNamespace(lora_rank=8, lora_alpha=16), computed)
+    config = model_args.get_kt_config_dict(
+        SimpleNamespace(finetuning_type="lora", lora_rank=8, lora_alpha=16),
+        computed,
+        {"kt_model_max_length": configured},
+    )
     assert config["kt_model_max_length"] == expected
 
 
-@pytest.mark.parametrize("configured", ["invalid", "0", "-1"])
-def test_kt_runtime_capacity_rejects_invalid_headroom(monkeypatch, configured):
-    monkeypatch.setenv("ACCELERATE_KT_MODEL_MAX_LENGTH", configured)
+@pytest.mark.parametrize("configured", [0, -1])
+def test_kt_runtime_capacity_rejects_invalid_headroom(configured):
     model_args = ModelArguments(model_name_or_path="dummy", use_kt=True)
-    with pytest.raises(ValueError, match="must be a positive integer"):
-        model_args.get_kt_config_dict(SimpleNamespace(lora_rank=8, lora_alpha=16), 1024)
+    training_args = SimpleNamespace(
+        kt_config={"kt_model_max_length": configured},
+        accelerator_config=SimpleNamespace(kt_config=None),
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        model_args._resolve_advanced_kt_config(training_args)

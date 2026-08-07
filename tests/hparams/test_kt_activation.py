@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import os
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +26,7 @@ from llamafactory.hparams import ModelArguments
 def isolate_kt_environment():
     names = (
         "ACCELERATE_KT_ACTIVATION_POLICY",
+        "ACCELERATE_KT_BACKEND",
         "ACCELERATE_KT_EXPERT_CHECKPOINT_PATH",
         "ACCELERATE_KT_LORA_ALPHA",
         "ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE",
@@ -61,7 +64,7 @@ def _training_args(**overrides):
 
 
 def _finetuning_args(**overrides):
-    values = {"stage": "sft", "lora_rank": 8, "lora_alpha": 16}
+    values = {"stage": "sft", "finetuning_type": "lora", "lora_rank": 8, "lora_alpha": 16, "lora_dropout": 0.0}
     values.update(overrides)
     return SimpleNamespace(**values)
 
@@ -134,50 +137,54 @@ def test_apply_kt_config_publishes_policy_without_cache_pool_override():
         "enabled": True,
         "kt_config": training_args.hf_kt_config._kt_config,
     }
+    assert training_args.hf_kt_config._kt_config["kt_train_mode"] == "lora"
+    assert training_args.hf_kt_config._kt_config["kt_full_weight_grad"] is False
 
 
-def test_apply_kt_config_normalizes_existing_plugin_config():
-    outer_config = {
-        "enabled": True,
-        "bypass_device_map_check": False,
-        "kt_config": {"kt_backend": "AMXBF16", "kt_model_max_length": 1152},
-        "kt_skip_expert_loading": True,
-    }
+def test_apply_kt_config_uses_flat_training_yaml_as_only_advanced_source():
     model_args = ModelArguments(model_name_or_path="dummy", use_kt=True, kt_cpu_activation="retain")
     training_args = _training_args(
-        hf_kt_config=SimpleNamespace(_kt_config=dict(outer_config)),
-        accelerator_config=SimpleNamespace(kt_config=dict(outer_config)),
+        kt_config={"kt_backend": "AMXBF16", "kt_model_max_length": 1152},
+        hf_kt_config=SimpleNamespace(
+            _kt_config={
+                "enabled": True,
+                "kt_skip_expert_loading": True,
+                "kt_backend": "AMXBF16",
+                "kt_model_max_length": 1152,
+            }
+        ),
     )
 
     model_args.apply_kt_config(_finetuning_args(), training_args, model_max_length=1024)
 
     plugin_config = training_args.accelerator_config.kt_config
     assert plugin_config["enabled"] is True
-    assert plugin_config["bypass_device_map_check"] is False
     assert plugin_config["kt_config"] is training_args.hf_kt_config._kt_config
     assert plugin_config["kt_config"]["kt_backend"] == "AMXBF16"
     assert plugin_config["kt_config"]["kt_model_max_length"] == 1152
-    assert plugin_config["kt_config"]["kt_skip_expert_loading"] is True
     assert "kt_config" not in plugin_config["kt_config"]
 
 
 def test_apply_kt_config_keeps_transformers_only_values_out_of_kernel_plugin():
-    model_args = ModelArguments(model_name_or_path="dummy", use_kt=True, kt_cpu_activation="retain")
+    model_args = ModelArguments(
+        model_name_or_path="dummy",
+        use_kt=True,
+        kt_cpu_activation="retain",
+        kt_weight_path="/tmp/int8-experts",
+        kt_non_expert_weight_path="/tmp/nonexpert-cache",
+    )
     training_args = _training_args(
-        hf_kt_config=SimpleNamespace(
-            _kt_config={
-                "kt_expert_weight_format": "int8",
-                "kt_non_expert_weight_path": "/tmp/nonexpert-cache",
-            }
-        )
+        kt_config={"kt_expert_weight_format": "int8"},
     )
 
     model_args.apply_kt_config(_finetuning_args(), training_args, model_max_length=1024)
 
-    assert training_args.hf_kt_config._kt_config["kt_non_expert_weight_path"] == "/tmp/nonexpert-cache"
     plugin_kernel_config = training_args.accelerator_config.kt_config["kt_config"]
     assert plugin_kernel_config["kt_expert_weight_format"] == "int8"
+    assert plugin_kernel_config["kt_backend"] == "auto"
+    assert plugin_kernel_config["kt_weight_lifecycle"] == "persistent"
     assert "kt_non_expert_weight_path" not in plugin_kernel_config
+    assert "kt_non_expert_weight_path" not in training_args.hf_kt_config._kt_config
 
 
 def test_apply_kt_config_is_idempotent():
@@ -195,11 +202,7 @@ def test_apply_kt_config_is_idempotent():
 @pytest.mark.parametrize("configured_capacity", [True, 1152.5, -1])
 def test_apply_kt_config_rejects_invalid_plugin_capacity(configured_capacity):
     model_args = ModelArguments(model_name_or_path="dummy", use_kt=True)
-    training_args = _training_args(
-        accelerator_config=SimpleNamespace(
-            kt_config={"enabled": True, "kt_config": {"kt_model_max_length": configured_capacity}}
-        )
-    )
+    training_args = _training_args(kt_config={"kt_model_max_length": configured_capacity})
 
     with pytest.raises(ValueError, match="must be a positive integer"):
         model_args.apply_kt_config(_finetuning_args(), training_args, model_max_length=1024)
@@ -253,10 +256,72 @@ def test_kt_rejects_legacy_activation_env(monkeypatch, env_name):
 
 def test_kt_rejects_duplicate_activation_policy_config():
     model_args = ModelArguments(model_name_or_path="dummy", use_kt=True)
-    training_args = _training_args(
-        accelerator_config=SimpleNamespace(
-            kt_config={"enabled": True, "kt_config": {"kt_activation_policy": {"cpu": "retain", "gpu": "recompute"}}}
-        )
-    )
-    with pytest.raises(ValueError, match="AcceleratorConfig.kt_config"):
+    training_args = _training_args(kt_config={"kt_activation_policy": {"cpu": "retain", "gpu": "recompute"}})
+    with pytest.raises(ValueError, match="owned by LLaMA-Factory"):
         model_args.apply_kt_config(_finetuning_args(), training_args, model_max_length=1024)
+
+
+def test_kt_rejects_accelerate_yaml_as_config_source():
+    model_args = ModelArguments(model_name_or_path="dummy", use_kt=True)
+    training_args = _training_args(accelerator_config=SimpleNamespace(kt_config={"kt_backend": "AMXBF16"}))
+    with pytest.raises(ValueError, match="remove `kt_config` from the Accelerate config"):
+        model_args.apply_kt_config(_finetuning_args(), training_args, model_max_length=1024)
+
+
+@pytest.mark.parametrize("forbidden", ["kt_lora_rank", "kt_weight_path", "enabled", "kt_train_mode"])
+def test_kt_rejects_lf_derived_fields_in_flat_config(forbidden):
+    model_args = ModelArguments(model_name_or_path="dummy", use_kt=True)
+    value = True if forbidden == "enabled" else 4
+    if forbidden == "enabled":
+        value = False  # True is the frozen Transformers injected default.
+    with pytest.raises(ValueError, match="derived|owned"):
+        model_args.apply_kt_config(
+            _finetuning_args(),
+            _training_args(kt_config={forbidden: value}),
+            model_max_length=1024,
+        )
+
+
+def test_kt_rejects_external_runtime_environment(monkeypatch):
+    monkeypatch.setenv("ACCELERATE_KT_BACKEND", "AMXBF16")
+    model_args = ModelArguments(model_name_or_path="dummy", use_kt=True)
+    with pytest.raises(ValueError, match="only KTransformers configuration source"):
+        model_args.apply_kt_config(_finetuning_args(), _training_args(), model_max_length=1024)
+
+
+def test_frozen_transformers_and_accelerate_accept_lf_plugin_shape(monkeypatch):
+    kt_integration = pytest.importorskip("transformers.integrations.kt")
+    accelerate_utils = pytest.importorskip("accelerate.utils")
+    plugin_class = getattr(accelerate_utils, "KTransformersPlugin", None)
+    if plugin_class is None:
+        pytest.skip("installed Accelerate does not provide the historical KT plugin")
+
+    kernel_config = {
+        "kt_backend": "AMXBF16",
+        "kt_activation_policy": {"cpu": "retain", "gpu": "recompute"},
+        "kt_lora_rank": 8,
+        "kt_lora_alpha": 16,
+        "kt_lora_dropout": 0.0,
+        "kt_model_max_length": 1024,
+        "kt_train_mode": "lora",
+        "kt_full_weight_grad": False,
+    }
+    hf_config = kt_integration.HfTrainerKTConfig(kernel_config)
+    fake_sft = types.ModuleType("kt_kernel.sft")
+
+    class FakeKTConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    fake_sft.KTConfig = FakeKTConfig
+    fake_package = types.ModuleType("kt_kernel")
+    fake_package.sft = fake_sft
+    monkeypatch.setitem(sys.modules, "kt_kernel", fake_package)
+    monkeypatch.setitem(sys.modules, "kt_kernel.sft", fake_sft)
+    try:
+        plugin = plugin_class(enabled=True, kt_config=kernel_config)
+        assert hf_config.kt_activation_policy == {"cpu": "retain", "gpu": "recompute"}
+        assert plugin.kt_config.kt_model_max_length == 1024
+        assert plugin.kt_config.kt_train_mode == "lora"
+    finally:
+        kt_integration.unset_kt_config()

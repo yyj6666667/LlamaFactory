@@ -249,8 +249,8 @@ def _check_extra_dependencies(
 ) -> None:
     if model_args.use_kt:
         check_version("kt-kernel", mandatory=True)
-        check_version("transformers-kt", mandatory=True)
-        check_version("accelerate-kt", mandatory=True)
+        check_version("transformers-kt==5.6.0.post1", mandatory=True)
+        check_version("accelerate-kt==1.14.0.post1", mandatory=True)
 
     if model_args.use_unsloth:
         check_version("unsloth", mandatory=True)

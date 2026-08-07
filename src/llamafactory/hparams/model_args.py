@@ -483,6 +483,15 @@ class KTransformersArguments:
         default=None,
         metadata={"help": "Path to pre-quantized INT8 expert weights (.kt files)."},
     )
+    kt_non_expert_weight_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to a validated BF16 non-expert cache used with routed INT8 experts. "
+                "This is a LLaMA-Factory loader setting, not a KT kernel option."
+            )
+        },
+    )
     kt_expert_checkpoint_path: str | None = field(
         default=None,
         metadata={"help": "Path to expert checkpoint (safetensors) for online conversion."},
@@ -499,6 +508,13 @@ class KTransformersArguments:
         default=None,
         metadata={"help": "Intermediate size for GPU-side LoRA Experts."},
     )
+    kt_hf_config: Any = field(
+        default=None,
+        init=False,
+        repr=False,
+        metadata={"help": "Internal strong reference to the frozen Transformers KT config."},
+    )
+    _kt_resolved_config: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.kt_cpu_activation not in {None, "retain", "recompute"}:
@@ -521,45 +537,124 @@ class KTransformersArguments:
 
         return {"cpu": cpu_activation, "gpu": gpu_activation}
 
-    @staticmethod
-    def _get_configured_activation_policy(config: Any) -> Any:
-        if isinstance(config, dict):
-            if "kt_activation_policy" in config:
-                return config["kt_activation_policy"]
-
-            nested_config = config.get("kt_config")
-            if nested_config is not None:
-                return KTransformersArguments._get_configured_activation_policy(nested_config)
-        elif config is not None:
-            policy = getattr(config, "kt_activation_policy", None)
-            if policy is not None:
-                return policy
-
-            nested_config = getattr(config, "kt_config", None)
-            if nested_config is not None and nested_config is not config:
-                return KTransformersArguments._get_configured_activation_policy(nested_config)
-
-        return None
-
-    @staticmethod
-    def _split_kt_plugin_config(config: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-        if not isinstance(config, dict):
-            return {}, {}
-
-        plugin_keys = {
+    _KT_ADVANCED_KEYS = frozenset(
+        {
+            "kt_backend",
+            "kt_expert_weight_format",
+            "kt_force_fused_expert_lora",
+            "kt_max_cache_depth",
+            "kt_model_max_length",
+            "kt_num_gpu_experts",
+            "kt_num_threads",
+            "kt_share_backward_bb",
+            "kt_threadpool_count",
+            "kt_tp_enabled",
+            "kt_weight_lifecycle",
+        }
+    )
+    _KT_FORBIDDEN_DERIVED_KEYS = frozenset(
+        {
+            "enabled",
+            "kt_activation_policy",
+            "kt_expert_checkpoint_path",
+            "kt_full_weight_grad",
+            "kt_lora_alpha",
+            "kt_lora_dropout",
+            "kt_lora_expert_intermediate_size",
+            "kt_lora_expert_num",
+            "kt_lora_rank",
+            "kt_non_expert_weight_path",
+            "kt_skip_expert_loading",
+            "kt_train_mode",
+            "kt_use_lora_experts",
+            "kt_weight_path",
+        }
+    )
+    _KT_PLUGIN_KEYS = frozenset(
+        {
             "allowed_distributed_types",
             "bypass_device_map_check",
-            "enabled",
             "kt_config",
             "require_single_process",
             "skip_device_placement",
         }
-        plugin_config = {key: value for key, value in config.items() if key in plugin_keys and key != "kt_config"}
-        kernel_config = {key: value for key, value in config.items() if key not in plugin_keys}
-        if isinstance(config.get("kt_config"), dict):
-            kernel_config = {**config["kt_config"], **kernel_config}
+    )
 
-        return plugin_config, kernel_config
+    @staticmethod
+    def _accelerator_kt_config(training_args: Any) -> Any:
+        accelerator_config = getattr(training_args, "accelerator_config", None)
+        if isinstance(accelerator_config, dict):
+            return accelerator_config.get("kt_config")
+        return getattr(accelerator_config, "kt_config", None)
+
+    def _resolve_advanced_kt_config(self, training_args: Any) -> dict[str, Any]:
+        raw_config = getattr(training_args, "kt_config", None)
+        accelerator_config = self._accelerator_kt_config(training_args)
+        reapplied_plugin = (
+            bool(self._kt_resolved_config)
+            and isinstance(accelerator_config, dict)
+            and accelerator_config.get("enabled") is True
+            and accelerator_config.get("kt_config") == self._kt_resolved_config
+            and set(accelerator_config) == {"enabled", "kt_config"}
+        )
+        if reapplied_plugin:
+            accelerator_config = None
+        if raw_config is None and accelerator_config is not None:
+            raise ValueError(
+                "Put KTransformers settings in the LLaMA-Factory training YAML `kt_config`; "
+                "remove `kt_config` from the Accelerate config."
+            )
+        if raw_config is None:
+            raw_config = {}
+        if not isinstance(raw_config, dict):
+            raise TypeError("LLaMA-Factory `kt_config` must be a flat mapping, not a file path or nested config.")
+
+        # Frozen Transformers injects these two defaults into the original dict
+        # during TrainingArguments.__post_init__. They are LF-owned constants,
+        # not user-facing runtime settings.
+        config = dict(raw_config)
+        for key in ("enabled", "kt_skip_expert_loading"):
+            if key in config and config.pop(key) is not True:
+                raise ValueError(f"`{key}` is derived by LLaMA-Factory and must not be overridden.")
+
+        nested_or_plugin = sorted(set(config) & self._KT_PLUGIN_KEYS)
+        if nested_or_plugin:
+            raise ValueError(
+                "LLaMA-Factory `kt_config` contains Accelerate plugin fields; "
+                f"use a flat KT kernel mapping instead: {nested_or_plugin}."
+            )
+        derived = sorted(set(config) & self._KT_FORBIDDEN_DERIVED_KEYS)
+        if derived:
+            raise ValueError(
+                f"These `kt_config` values are owned by LLaMA-Factory top-level or finetuning arguments: {derived}."
+            )
+        unknown = sorted(set(config) - self._KT_ADVANCED_KEYS)
+        if unknown:
+            raise ValueError(f"Unsupported LLaMA-Factory `kt_config` fields: {unknown}.")
+
+        if (
+            accelerator_config is not None
+            and accelerator_config is not raw_config
+            and accelerator_config != raw_config
+        ):
+            raise ValueError(
+                "AcceleratorConfig.kt_config is not an independent KT configuration source; "
+                "remove KT settings from the Accelerate config."
+            )
+
+        capacity = config.get("kt_model_max_length")
+        if capacity is not None:
+            if isinstance(capacity, bool) or not isinstance(capacity, (int, str)):
+                raise ValueError("`kt_model_max_length` must be a positive integer.")
+            try:
+                capacity = int(capacity)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("`kt_model_max_length` must be a positive integer.") from exc
+            if capacity <= 0:
+                raise ValueError("`kt_model_max_length` must be a positive integer.")
+            config["kt_model_max_length"] = capacity
+
+        return config
 
     def configure_kt_checkpointing(self, training_args: Any) -> None:
         r"""Keep LLaMA-Factory as the only gradient-checkpointing entry point for KT."""
@@ -607,6 +702,15 @@ class KTransformersArguments:
                 f"remove legacy environment settings {legacy_sources}."
             )
 
+        external_runtime_env = sorted(
+            name for name, value in os.environ.items() if name.startswith("ACCELERATE_KT_") and value != ""
+        )
+        if external_runtime_env:
+            raise ValueError(
+                "The LLaMA-Factory training YAML is the only KTransformers configuration source; "
+                f"remove external runtime settings {external_runtime_env}."
+            )
+
         self.get_kt_activation_policy()  # validate the resolved combination
         if not self.disable_gradient_checkpointing:
             self.use_reentrant_gc = False
@@ -614,24 +718,26 @@ class KTransformersArguments:
         training_args.gradient_checkpointing = False
         training_args.gradient_checkpointing_kwargs = None
 
-    def get_kt_config_dict(self, finetuning_args: Any, model_max_length: int | None) -> dict[str, Any]:
+    def get_kt_config_dict(
+        self,
+        finetuning_args: Any,
+        model_max_length: int | None,
+        advanced_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         r"""Build KT config values from LLaMA-Factory model and LoRA arguments."""
-        kt_model_max_length = model_max_length
-        configured_capacity_env = os.environ.get("ACCELERATE_KT_MODEL_MAX_LENGTH")
-        if configured_capacity_env:
-            try:
-                configured_capacity = int(configured_capacity_env)
-            except ValueError as exc:
-                raise ValueError("`ACCELERATE_KT_MODEL_MAX_LENGTH` must be a positive integer.") from exc
-
-            if configured_capacity <= 0:
-                raise ValueError("`ACCELERATE_KT_MODEL_MAX_LENGTH` must be a positive integer.")
-
-            kt_model_max_length = max(kt_model_max_length or 0, configured_capacity)
+        advanced_config = dict(advanced_config or {})
+        configured_capacity = advanced_config.get("kt_model_max_length")
+        kt_model_max_length = max(model_max_length or 0, configured_capacity or 0) or None
+        finetuning_type = getattr(finetuning_args, "finetuning_type", "lora")
+        train_mode = {"full": "full", "freeze": "hybrid", "lora": "lora"}.get(finetuning_type)
+        if train_mode is None:
+            raise ValueError(f"KTransformers does not support `finetuning_type: {finetuning_type}`.")
 
         kt_config = {
+            **advanced_config,
             "kt_lora_rank": getattr(finetuning_args, "lora_rank", None),
             "kt_lora_alpha": getattr(finetuning_args, "lora_alpha", None),
+            "kt_lora_dropout": getattr(finetuning_args, "lora_dropout", None),
             "kt_weight_path": self.kt_weight_path,
             "kt_expert_checkpoint_path": self.kt_expert_checkpoint_path,
             "kt_model_max_length": kt_model_max_length,
@@ -639,7 +745,33 @@ class KTransformersArguments:
             "kt_lora_expert_num": self.kt_lora_expert_num,
             "kt_lora_expert_intermediate_size": self.kt_lora_expert_intermediate_size,
             "kt_activation_policy": self.get_kt_activation_policy(),
+            "kt_train_mode": train_mode,
+            "kt_full_weight_grad": train_mode in {"full", "hybrid"},
         }
+        if train_mode == "full":
+            for key in ("kt_lora_rank", "kt_lora_alpha", "kt_lora_dropout"):
+                kt_config.pop(key, None)
+
+        weight_format = kt_config.get("kt_expert_weight_format")
+        if weight_format is not None:
+            weight_format = str(weight_format).strip().lower()
+            if weight_format not in {"bf16", "int8", "fp8"}:
+                raise ValueError("`kt_expert_weight_format` must be `bf16`, `int8`, or `fp8`.")
+            kt_config["kt_expert_weight_format"] = weight_format
+        if weight_format == "int8":
+            if not self.kt_weight_path:
+                raise ValueError("Routed INT8 training requires top-level `kt_weight_path`.")
+            if not self.kt_non_expert_weight_path:
+                raise ValueError("Routed INT8 training requires top-level `kt_non_expert_weight_path`.")
+            if train_mode != "lora":
+                raise ValueError("Routed INT8 training supports frozen-base LoRA only.")
+            kt_config.setdefault("kt_backend", "auto")
+            kt_config.setdefault("kt_weight_lifecycle", "persistent")
+            if kt_config["kt_weight_lifecycle"] != "persistent":
+                raise ValueError("Routed INT8 training requires `kt_weight_lifecycle: persistent`.")
+        elif self.kt_non_expert_weight_path:
+            raise ValueError("`kt_non_expert_weight_path` is only valid with `kt_expert_weight_format: int8`.")
+
         return {key: value for key, value in kt_config.items() if value is not None}
 
     def apply_kt_config(self, finetuning_args: Any, training_args: Any, model_max_length: int | None) -> None:
@@ -648,17 +780,8 @@ class KTransformersArguments:
             return
 
         self.configure_kt_checkpointing(training_args)
-        kt_config = self.get_kt_config_dict(finetuning_args, model_max_length)
-        env_mapping = {
-            "kt_weight_path": "ACCELERATE_KT_WEIGHT_PATH",
-            "kt_expert_checkpoint_path": "ACCELERATE_KT_EXPERT_CHECKPOINT_PATH",
-            "kt_model_max_length": "ACCELERATE_KT_MODEL_MAX_LENGTH",
-            "kt_lora_rank": "ACCELERATE_KT_LORA_RANK",
-            "kt_lora_alpha": "ACCELERATE_KT_LORA_ALPHA",
-            "kt_use_lora_experts": "ACCELERATE_KT_USE_LORA_EXPERTS",
-            "kt_lora_expert_num": "ACCELERATE_KT_LORA_EXPERT_NUM",
-            "kt_lora_expert_intermediate_size": "ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE",
-        }
+        advanced_config = self._resolve_advanced_kt_config(training_args)
+        kt_config = self.get_kt_config_dict(finetuning_args, model_max_length, advanced_config)
 
         hf_kt = getattr(training_args, "hf_kt_config", None)
         if hf_kt is None or not hasattr(hf_kt, "_kt_config") or not isinstance(hf_kt._kt_config, dict):
@@ -669,91 +792,17 @@ class KTransformersArguments:
                     "The installed Transformers build does not provide the KTransformers integration."
                 ) from exc
 
-            hf_kt = HfTrainerKTConfig({})
+            hf_kt = HfTrainerKTConfig(kt_config)
             training_args.hf_kt_config = hf_kt
+        hf_kt._kt_config = kt_config
+        hf_kt._llamafactory_authoritative = True
+        self.kt_hf_config = hf_kt
+        self._kt_resolved_config = dict(kt_config)
+        training_args.kt_config = dict(advanced_config)
+        os.environ["ACCELERATE_USE_KT"] = "true"
 
         accelerator_config = getattr(training_args, "accelerator_config", None)
-        configured_policies = {
-            "TrainingArguments.kt_config": self._get_configured_activation_policy(
-                getattr(training_args, "kt_config", None)
-            ),
-            "TrainingArguments.hf_kt_config": self._get_configured_activation_policy(hf_kt._kt_config),
-            "AcceleratorConfig.kt_config": self._get_configured_activation_policy(
-                accelerator_config.get("kt_config")
-                if isinstance(accelerator_config, dict)
-                else getattr(accelerator_config, "kt_config", None)
-            ),
-        }
-        activation_policy = self.get_kt_activation_policy()
-        is_reapplying_lf_config = getattr(hf_kt, "_llamafactory_authoritative", False)
-        duplicate_policy_sources = [
-            name
-            for name, policy in configured_policies.items()
-            if policy is not None
-            and not (
-                is_reapplying_lf_config
-                and name in {"TrainingArguments.hf_kt_config", "AcceleratorConfig.kt_config"}
-                and policy == activation_policy
-            )
-        ]
-        if duplicate_policy_sources:
-            raise ValueError(
-                "Remove `kt_activation_policy` from the Accelerate/Transformers KT config; "
-                f"use LLaMA-Factory's `kt_cpu_activation` instead. Sources: {duplicate_policy_sources}."
-            )
-
-        accelerator_kt_config = (
-            accelerator_config.get("kt_config")
-            if isinstance(accelerator_config, dict)
-            else getattr(accelerator_config, "kt_config", None)
-        )
-        training_plugin, training_kernel = self._split_kt_plugin_config(getattr(training_args, "kt_config", None))
-        hf_plugin, hf_kernel = self._split_kt_plugin_config(hf_kt._kt_config)
-        accelerator_plugin, accelerator_kernel = self._split_kt_plugin_config(accelerator_kt_config)
-        kernel_config = {**accelerator_kernel, **training_kernel, **hf_kernel, **kt_config}
-        configured_capacities = [
-            config["kt_model_max_length"]
-            for config in (accelerator_kernel, training_kernel, hf_kernel, kt_config)
-            if config.get("kt_model_max_length") is not None
-        ]
-        if configured_capacities:
-            if any(isinstance(value, bool) or not isinstance(value, (int, str)) for value in configured_capacities):
-                raise ValueError("`kt_model_max_length` must be a positive integer.")
-
-            try:
-                configured_capacities = [int(value) for value in configured_capacities]
-            except (TypeError, ValueError) as exc:
-                raise ValueError("`kt_model_max_length` must be a positive integer.") from exc
-
-            if any(value <= 0 for value in configured_capacities):
-                raise ValueError("`kt_model_max_length` must be a positive integer.")
-
-            kernel_config["kt_model_max_length"] = max(configured_capacities)
-
-        hf_kt._kt_config = kernel_config
-        hf_kt._llamafactory_authoritative = True
-
-        # Some values are consumed by Transformers while loading the model but
-        # are not KTConfig constructor arguments.  Keep them in the HF config
-        # and environment, but do not pass them to Accelerate's kernel plugin.
-        plugin_kernel_config = kernel_config
-        if "kt_non_expert_weight_path" in kernel_config:
-            plugin_kernel_config = {
-                key: value for key, value in kernel_config.items() if key != "kt_non_expert_weight_path"
-            }
-
-        for key, env_key in env_mapping.items():
-            value = kernel_config.get(key)
-            if value is not None:
-                os.environ[env_key] = str(value)
-
-        plugin_config = {
-            **hf_plugin,
-            **training_plugin,
-            **accelerator_plugin,
-            "enabled": True,
-            "kt_config": plugin_kernel_config,
-        }
+        plugin_config = {"enabled": True, "kt_config": kt_config}
         if isinstance(accelerator_config, dict):
             accelerator_config["kt_config"] = plugin_config
         elif accelerator_config is not None:
