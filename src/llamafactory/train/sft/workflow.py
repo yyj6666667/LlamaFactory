@@ -24,6 +24,7 @@ from ...extras.misc import calculate_tps
 from ...extras.packages import is_transformers_version_greater_than
 from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
+from ...model.model_utils.kt_fsdp import validate_kt_distributed_checkpoint_policy
 from ..trainer_utils import create_modelcard_and_push, create_ref_model
 from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
 from .trainer import CustomSeq2SeqTrainer
@@ -46,6 +47,7 @@ def run_sft(
     generating_args: "GeneratingArguments",
     callbacks: Optional[list["TrainerCallback"]] = None,
 ):
+    validate_kt_distributed_checkpoint_policy(model_args, training_args)
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
@@ -105,6 +107,7 @@ def run_sft(
     # Initialize our Trainer
     trainer = CustomSeq2SeqTrainer(
         model=model,
+        model_args=model_args,
         args=training_args,
         finetuning_args=finetuning_args,
         data_collator=data_collator,

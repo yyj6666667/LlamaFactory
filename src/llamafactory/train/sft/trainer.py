@@ -28,6 +28,13 @@ from typing_extensions import override
 
 from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
+from ...model.model_utils.kt_artifacts import publish_kt_int8_adapter_manifest
+from ...model.model_utils.kt_fsdp import (
+    get_kt_fsdp2_adapter_state_dict,
+    is_kt_fsdp2_peft,
+    maybe_register_kt_fsdp2_persistent_buffer_hook,
+    raise_kt_distributed_save_errors,
+)
 from ..callbacks import SaveProcessorCallback
 from ..fp8_utils import configure_fp8_environment, patch_accelerator_for_fp8, verify_fp8_status
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
@@ -65,6 +72,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 patch_accelerator_for_fp8()
 
         super().__init__(**kwargs)
+        self.model_args = model_args
+        self._lf_use_kt = bool(getattr(model_args, "use_kt", False) or getattr(self, "is_kt_enabled", False))
+        self._kt_fsdp2_buffer_hook = maybe_register_kt_fsdp2_persistent_buffer_hook(
+            self.model, self.accelerator, self._lf_use_kt
+        )
         if processor is not None:
             # avoid wrong loss under gradient accumulation
             # https://github.com/huggingface/transformers/pull/36044#issuecomment-2746657112
@@ -228,3 +240,38 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         with open(output_prediction_file, "w", encoding="utf-8") as f:
             for text, pred, label in zip(decoded_inputs, decoded_preds, decoded_labels):
                 f.write(json.dumps({"prompt": text, "predict": pred, "label": label}, ensure_ascii=False) + "\n")
+
+    @override
+    def _save(self, output_dir: Optional[str] = None, state_dict: Optional[dict[str, Any]] = None) -> None:
+        super()._save(output_dir=output_dir, state_dict=state_dict)
+        if not self._lf_use_kt or not self.args.should_save:
+            return
+
+        output_dir = output_dir or self.args.output_dir
+        model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+        publish_kt_int8_adapter_manifest(model, output_dir, self.model_args)
+
+    @override
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False) -> None:
+        r"""Save KT FSDP2 PEFT adapters without gathering the frozen base model."""
+        if not is_kt_fsdp2_peft(self.model, self.accelerator, self._lf_use_kt):
+            return super().save_model(output_dir=output_dir, _internal_call=_internal_call)
+
+        output_dir = output_dir or self.args.output_dir
+        # DCP is collective even though only rank 0 receives the full CPU state dict.
+        state_dict = get_kt_fsdp2_adapter_state_dict(self.model)
+        is_main_process = bool(getattr(self.accelerator, "is_main_process", False))
+        save_exception: Optional[Exception] = None
+        save_error: Optional[str] = None
+        if is_main_process and self.args.should_save:
+            try:
+                # Frozen Transformers owns the historical adapter file layout and fused KT tail save.
+                self._save(output_dir, state_dict=state_dict)
+            except Exception as exc:
+                save_exception = exc
+                save_error = f"{type(exc).__name__}: {exc}"
+
+        raise_kt_distributed_save_errors(save_error, cause=save_exception)
+        self.accelerator.wait_for_everyone()
+        if self.args.push_to_hub and not _internal_call and is_main_process:
+            self.push_to_hub(commit_message="Model save", revision=self.args.hub_revision)
