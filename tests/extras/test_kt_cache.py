@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from safetensors.torch import save_file
+from transformers import PretrainedConfig
 
 from llamafactory.extras.kt_cache import (
     KT_NON_EXPERT_MANIFEST_NAME,
@@ -54,6 +55,10 @@ def _make_artifacts(tmp_path):
         "quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]},
     }
     _write_json(source / "config.json", source_config)
+    _write_json(
+        source / "generation_config.json",
+        {"bos_token_id": 11, "eos_token_id": 12, "max_new_tokens": 13},
+    )
     _write_json(source / "model.safetensors.index.json", {"metadata": {}, "weight_map": {}})
 
     cache = tmp_path / "cache"
@@ -183,8 +188,29 @@ def test_prepare_switches_only_weight_source_and_clears_source_quantizer(tmp_pat
     assert not hasattr(config, "quantization_config")
     assert config.name_or_path == str(source)
     assert init_kwargs["pretrained_model_name_or_path"] == str(cache)
+    assert init_kwargs["generation_config"].bos_token_id == 11
+    assert init_kwargs["generation_config"].eos_token_id == 12
+    assert init_kwargs["generation_config"].max_new_tokens == 13
     assert init_kwargs["output_loading_info"] is True
     assert init_kwargs["local_files_only"] is True
+    assert not (cache / "generation_config.json").exists()
+    assert not (cache / "config.json").exists()
+
+
+def test_prepare_uses_model_config_when_source_has_no_generation_config(tmp_path):
+    source, cache, routed = _make_artifacts(tmp_path)
+    (source / "generation_config.json").unlink()
+    config = PretrainedConfig(bos_token_id=21, eos_token_id=22)
+    config.quantization_config = {"quant_method": "fp8"}
+    config.name_or_path = str(source)
+    init_kwargs = {"config": config, "pretrained_model_name_or_path": str(source)}
+
+    resolved = prepare_kt_int8_cache_loading(config, _model_args(source, cache, routed), init_kwargs)
+
+    assert resolved is not None
+    assert init_kwargs["pretrained_model_name_or_path"] == str(cache)
+    assert init_kwargs["generation_config"].bos_token_id == 21
+    assert init_kwargs["generation_config"].eos_token_id == 22
 
 
 def test_filtered_frozen_loading_info_still_requires_exact_model_keys(tmp_path):

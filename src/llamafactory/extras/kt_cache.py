@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch.distributed as dist
 from safetensors import safe_open
+from transformers import GenerationConfig
 
 from . import logging
 
@@ -441,9 +442,21 @@ def prepare_kt_int8_cache_loading(
     if hasattr(config, "quantization_config"):
         delattr(config, "quantization_config")
     config.name_or_path = model_args.model_name_or_path
+    generation_kwargs = {
+        name: init_kwargs[name] for name in ("cache_dir", "revision", "token") if init_kwargs.get(name) is not None
+    }
+    try:
+        generation_config = GenerationConfig.from_pretrained(
+            model_args.model_name_or_path,
+            local_files_only=True,
+            **generation_kwargs,
+        )
+    except OSError:
+        generation_config = GenerationConfig.from_model_config(config)
     init_kwargs.update(
         {
             "config": config,
+            "generation_config": generation_config,
             "local_files_only": True,
             "output_loading_info": True,
             "pretrained_model_name_or_path": cache.path,
