@@ -35,6 +35,7 @@ LlamaFactory 文档
    advanced/lora-and-quantization/lora
    advanced/lora-and-quantization/quantization
    advanced/ktransformers
+   advanced/ktransformers-production-cookbook
    advanced/distributed/fsdp
    advanced/distributed/deepspeed
    advanced/distributed/parallel-dp-tp-ep-sp-cp

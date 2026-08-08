@@ -1,5 +1,7 @@
 # KTransformers LoRA SFT
 
+[生产部署、验收口径、保存续训和故障排查 Cookbook](./ktransformers-production-cookbook.md)
+
 KTransformers（KT）将 MoE routed experts 放在 CPU 执行，LLaMA-Factory 继续负责数据、LoRA 参数和训练入口。
 当前生产范围是 routed-BF16 LoRA 与 routed-INT8 LoRA；Accelerate 配置只负责 FSDP2，不再保存 KT 参数。
 
@@ -81,7 +83,7 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
 
 ## 新进程加载
 
-对话或评测必须使用本地的完整 KT adapter 目录，并重复训练时的 LoRA 形状配置：`finetuning_type`、
+新进程对话或生成验证必须使用本地的完整 KT adapter 目录，并重复训练时的 LoRA 形状配置：`finetuning_type`、
 `lora_rank`、`lora_alpha`、`lora_dropout`，以及相同的 KT base weight 配置。routed INT8 尤其要沿用训练时
 的 `kt_weight_path` 和 `kt_non_expert_weight_path`。
 
@@ -103,8 +105,9 @@ kt_config:
 
 ```bash
 llamafactory-cli chat path/to/kt_adapter_infer.yaml
-llamafactory-cli eval path/to/kt_adapter_eval.yaml
 ```
+
+KT CLI `eval` 尚未纳入当前生产合同；自动验收请使用独立 fresh-generation 脚本，详见生产 Cookbook。
 
 目录必须包含 standard PEFT adapter 文件；使用 fused routed-expert LoRA 时，还必须包含
 `fused_expert_lora.safetensors` 和 `kt_adapter_manifest.json`。LLaMA-Factory 先加载 standard PEFT，随后由
@@ -115,5 +118,5 @@ adapter ID 会在加载模型前报错，Hub bundle 需要先完整下载到本�
 size。artifact 缺失、hash 不匹配或来源模型不一致时会直接失败，不会退回源 checkpoint。
 
 不要同时启用 Transformers/FSDP activation checkpointing、Unsloth GC，也不要把 `kt_config` 放入
-Accelerate YAML。每次训练都应确认 loss/grad finite、base model 未修改，并验证 standard/router/fused LoRA
-均包含非零更新。
+Accelerate YAML。每次训练都应确认 loss/grad finite、base model 未修改，并验证 PEFT artifact（含 router）和
+fused LoRA 均包含非零更新；router 计数是 PEFT artifact 的子集，不能重复相加。
