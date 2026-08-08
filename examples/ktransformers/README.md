@@ -1,32 +1,58 @@
-# KTransformers SFT examples
+# KTransformers LoRA SFT examples
 
-KTransformers uses LLaMA-Factory's native `disable_gradient_checkpointing` setting for GPU activations. CPU expert
-activations have one additional, optional setting:
+The Qwen3.5-397B text-only BF16 and DeepSeek-V3.1 routed-INT8 templates cover the release-qualified KTransformers SFT
+contracts. The Qwen template requires the verified `TEXTONLY` model materialization shipped with the release bundle;
+the original Hub config is not qualified for this runtime.
+`accelerate/fsdp2_kt.yaml` is the only release launcher config. The current integration does not provide a
+`ktransformers` inference backend in LLaMA-Factory. See the [Chinese production guide](../../docs/zh/advanced/ktransformers.md)
+for prerequisites, validated models, artifacts, and failure handling.
 
-```yaml
-use_kt: true
-disable_gradient_checkpointing: false
-kt_cpu_activation: retain
+## Launch
+
+Install a matching KTransformers SFT stack, edit the model/data/output paths in a training YAML, then launch the worker
+script directly with Accelerate:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
+  --main_process_port 0 \
+  --config_file examples/ktransformers/accelerate/fsdp2_kt.yaml \
+  src/train.py \
+  examples/ktransformers/train_lora/qwen3_5moe_lora_sft_kt.yaml
 ```
 
-The supported combinations are:
+Do not wrap `llamafactory-cli train` inside `accelerate launch`; that can create a nested distributed launch. Accelerate
+files configure only FSDP2 and process topology. Every KT setting belongs to the LLaMA-Factory training YAML:
 
-| GPU checkpointing | `kt_cpu_activation` | Behavior |
+- `use_kt`, `kt_cpu_activation`, and weight paths are top-level fields.
+- `kt_config` is one flat kernel mapping without `enabled` or another nested `kt_config`.
+- LoRA rank, alpha, dropout, activation policy, and train mode are derived by LLaMA-Factory.
+
+## Activation policy
+
+LLaMA-Factory's `disable_gradient_checkpointing` controls GPU activations. `kt_cpu_activation` independently chooses
+whether CPU expert activations are retained while GPU checkpointing is enabled.
+
+| `disable_gradient_checkpointing` | `kt_cpu_activation` | CPU / GPU behavior |
 | --- | --- | --- |
-| enabled (default) | omitted or `recompute` | Recompute GPU and CPU expert activations. |
-| enabled (default) | `retain` | Recompute GPU activations and reuse retained CPU expert activations. |
-| disabled | omitted or `retain` | Retain both GPU and CPU activations. |
-| disabled | `recompute` | Unsupported. |
+| `false` (default) | omitted or `recompute` | recompute / recompute |
+| `false` (default) | `retain` | retain / recompute |
+| `true` | omitted or `retain` | retain / retain (not covered by the final hardware matrix) |
+| `true` | `recompute` | unsupported; validation fails |
 
-`retain` can improve step time but keeps KT CPU expert checkpoint state in host memory until backward. It currently
-supports CPU-expert AMX BF16 training and supported frozen INT8/FP8 LoRA paths. Leave it unset for INT4, GPU expert,
-LoRA-expert, and Hybrid paths. When GPU checkpointing is enabled, KTransformers uses non-reentrant checkpointing; do not
-also enable Transformers Trainer, Unsloth, or FSDP activation checkpointing.
+CPU `retain` can improve step time but requires more host RAM. It is maintained for CPU-expert AMX BF16 training and
+the validated frozen routed-INT8 LoRA path. Do not also enable Trainer, Unsloth, or FSDP activation checkpointing.
 
-Some model preprocessors add tokens after applying `cutoff_len`. For example, Qwen3.5 text-only batches can include
-dummy-image tokens. Set `kt_model_max_length` with enough headroom in the Accelerate KT config; LLaMA-Factory preserves
-a configured capacity when it is larger than the computed text capacity. The Qwen3.5 S2048 example uses
-`accelerate/fsdp2_kt_qwen3_5.yaml` with capacity 2176.
+## Weights and saves
 
-With `pure_bf16: true`, new and reloaded KT adapters remain BF16. Existing FP32 adapter checkpoints are not automatically
-downcast.
+- The BF16 examples keep `kt_backend: AMXBF16` in their training YAML.
+- The DeepSeek-V3.1 INT8 example requires both a validated routed-INT8 directory and a validated BF16 non-expert cache.
+  The training output also contains `kt_adapter_manifest.json` with their provenance.
+- Qwen3.5 requires a maintainer-produced, verified `TEXTONLY` model directory. Do not point the example at the original
+  Hub config or edit `config.json` by hand. Text-only preprocessing can add dummy-image tokens after `cutoff_len`; the
+  S2048 example therefore reserves `kt_model_max_length: 2176`.
+- Multi-rank KT saves adapters only. Optimizer-state resume, periodic optimizer checkpoints, and
+  `load_best_model_at_end` are not supported; the examples use `save_only_model: true`.
+- Every launch needs a fresh, empty `output_dir`. Adapter continuation is not supported: `adapter_name_or_path` does not
+  restore KT fused expert LoRA in this release.
+
+`pure_bf16: true` creates KT adapters in BF16. Existing FP32 adapters are not automatically downcast.

@@ -1,8 +1,7 @@
 ### model
-# Use the verified text-only materialization supplied with the KT SFT release bundle.
-# The original Hub config is not qualified by this example.
-model_name_or_path: /path/to/Qwen3.5-397B-A17B-TEXTONLY
-trust_remote_code: true
+model_name_or_path: /path/to/DeepSeek-V3.1
+trust_remote_code: false
+flash_attn: sdpa
 disable_gradient_checkpointing: false
 
 ### method
@@ -17,7 +16,7 @@ pure_bf16: true
 
 ### dataset
 dataset: identity, alpaca_en_demo
-template: qwen3_5_nothink
+template: deepseek3
 cutoff_len: 2048
 max_samples: 100000
 overwrite_cache: true
@@ -25,13 +24,13 @@ preprocessing_num_workers: 16
 dataloader_num_workers: 4
 
 ### output
-output_dir: saves/KT_FT_qwen35Moe
+output_dir: saves/KT_FT_deepseekV3_1_int8
 logging_steps: 10
 save_strategy: "no"
 plot_loss: true
 overwrite_output_dir: false
 save_only_model: true
-report_to: none  # choices: [none, wandb, tensorboard, swanlab, mlflow]
+report_to: none
 
 ### train
 per_device_train_batch_size: 1
@@ -47,14 +46,18 @@ ddp_timeout: 180000000
 use_kt: true
 # Release-qualified S2048 policy. `recompute` may lower the peak, but 1 TB is not qualified.
 kt_cpu_activation: retain
+# Both directories must be absolute, non-symlink paths with validated ready manifests.
+kt_weight_path: /path/to/DeepSeek-V3.1-routed-INT8
+kt_non_expert_weight_path: /path/to/DeepSeek-V3.1-BF16-nonexpert
 kt_config:
-  kt_backend: AMXBF16
+  kt_backend: auto
+  kt_expert_weight_format: int8
+  kt_weight_lifecycle: persistent
   kt_num_threads: 64  # Tune to the CPU/NUMA allocation.
   kt_tp_enabled: true
-  kt_threadpool_count: 2
+  kt_threadpool_count: 2  # Must match the routed INT8 manifest.
   kt_max_cache_depth: 2
   kt_share_backward_bb: true
   kt_num_gpu_experts: 0
   kt_force_fused_expert_lora: true
-  # S2048 plus Qwen3.5 text-only dummy-image tokens.
-  kt_model_max_length: 2176
+  kt_model_max_length: 2048

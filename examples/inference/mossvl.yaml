@@ -2,5 +2,5 @@
 
 model_name_or_path: OpenMOSS-Team/MOSS-VL-Instruct-0708
 template: moss_vl
-infer_backend: huggingface  # choices: [huggingface, vllm, sglang, ktransformers]
+infer_backend: huggingface  # choices: [huggingface, vllm, sglang]
 trust_remote_code: true
