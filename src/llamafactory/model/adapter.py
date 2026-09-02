@@ -264,6 +264,12 @@ def _setup_lora_tuning(
                 "use_dora": finetuning_args.use_dora,
                 "modules_to_save": finetuning_args.additional_target,
             }
+            if model_args.use_kt:
+                from transformers.integrations.kt_artifacts import get_kt_fused_lora_exclude_modules
+
+                exclude_modules = get_kt_fused_lora_exclude_modules(model)
+                if exclude_modules is not None:
+                    peft_kwargs["exclude_modules"] = exclude_modules
         elif finetuning_args.finetuning_type == "oft":
             peft_kwargs = {
                 "r": finetuning_args.oft_rank,
