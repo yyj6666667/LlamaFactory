@@ -291,6 +291,14 @@ _register_composite_model(
     model_type="kimi_vl",
 )
 
+for model_type in ("kimi_k25", "kimi_k2_5", "kimi_k26", "kimi_k2_6"):
+    _register_composite_model(
+        model_type=model_type,
+        projector_keys=["mm_projector"],
+        vision_model_keys=["vision_tower"],
+        language_model_keys=["language_model"],
+    )
+
 
 _register_composite_model(
     model_type="llama4",

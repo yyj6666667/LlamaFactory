@@ -62,6 +62,15 @@ class _MossVLFixture(torch.nn.Module):
         return layer
 
 
+@pytest.mark.parametrize("model_type", ("kimi_k25", "kimi_k2_5", "kimi_k26", "kimi_k2_6"))
+def test_kimi_composite_model_aliases(model_type: str):
+    composite_model = COMPOSITE_MODELS[model_type]
+
+    assert composite_model.projector_keys == ["mm_projector"]
+    assert composite_model.vision_model_keys == ["vision_tower"]
+    assert composite_model.language_model_keys == ["language_model"]
+
+
 @pytest.mark.parametrize("freeze_vision_tower", (False, True))
 @pytest.mark.parametrize("freeze_multi_modal_projector", (False, True))
 @pytest.mark.parametrize("freeze_language_model", (False, True))
