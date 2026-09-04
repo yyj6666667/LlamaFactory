@@ -90,6 +90,10 @@ def configure_attn_implementation(config: "PretrainedConfig", model_args: "Model
     elif getattr(config, "model_type", None) == "kimi_vl":
         setattr(config.vision_config, "_attn_implementation", requested_attn_implementation)
         setattr(config.text_config, "_attn_implementation", requested_attn_implementation)
+    elif getattr(config, "model_type", None) in {"kimi_k25", "kimi_k2_5", "kimi_k26", "kimi_k2_6"}:
+        setattr(config, "_attn_implementation", requested_attn_implementation)
+        setattr(config.vision_config, "_attn_implementation", requested_attn_implementation)
+        setattr(config.text_config, "_attn_implementation", requested_attn_implementation)
     elif getattr(config, "model_type", None) == "youtu_vl":
         setattr(config, "attn_implementation", requested_attn_implementation)
         setattr(config, "_attn_implementation", requested_attn_implementation)

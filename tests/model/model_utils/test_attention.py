@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 from transformers.utils import is_flash_attn_2_available
@@ -27,7 +28,9 @@ except ImportError:
         return True
 
 
+from llamafactory.extras.constants import AttentionFunction
 from llamafactory.extras.packages import is_transformers_version_greater_than
+from llamafactory.model.model_utils.attention import configure_attn_implementation
 from llamafactory.train.test_utils import load_infer_model
 
 
@@ -37,6 +40,22 @@ INFER_ARGS = {
     "model_name_or_path": TINY_LLAMA3,
     "template": "llama3",
 }
+
+
+@pytest.mark.parametrize("model_type", ["kimi_k25", "kimi_k2_5", "kimi_k26", "kimi_k2_6"])
+def test_kimi_composite_attention_implementation_is_propagated(model_type):
+    config = SimpleNamespace(
+        model_type=model_type,
+        vision_config=SimpleNamespace(_attn_implementation="flash_attention_2"),
+        text_config=SimpleNamespace(_attn_implementation="flash_attention_2"),
+        _attn_implementation="flash_attention_2",
+    )
+
+    configure_attn_implementation(config, SimpleNamespace(flash_attn=AttentionFunction.DISABLED))
+
+    assert config._attn_implementation == "eager"
+    assert config.vision_config._attn_implementation == "eager"
+    assert config.text_config._attn_implementation == "eager"
 
 
 @pytest.mark.xfail(is_transformers_version_greater_than("4.48"), reason="Attention refactor.")
