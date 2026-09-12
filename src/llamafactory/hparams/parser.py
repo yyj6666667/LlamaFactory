@@ -15,16 +15,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
-import sys
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Optional
 
 import torch
 import transformers
-from omegaconf import OmegaConf
 from transformers import HfArgumentParser
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.trainer_utils import get_last_checkpoint
@@ -32,6 +28,7 @@ from transformers.training_args import ParallelMode
 from transformers.utils import is_torch_bf16_gpu_available, is_torch_npu_available
 
 from ..extras import logging
+from ..extras.arguments import get_use_kt, read_args
 from ..extras.constants import CHECKPOINT_NAMES, EngineName
 from ..extras.misc import check_dependencies, check_version, get_current_device, is_env_enabled
 from ..extras.packages import is_mcore_adapter_available, is_megatron_bridge_available
@@ -45,9 +42,6 @@ from .training_args import RayArguments, TrainingArguments
 
 
 logger = logging.get_logger(__name__)
-
-check_dependencies()
-
 
 @dataclass
 class _KTransformersRuntimeArguments:
@@ -109,23 +103,6 @@ _TRAIN_MBRIDGE_CLS = tuple[
 ]
 
 
-def read_args(args: dict[str, Any] | list[str] | None = None) -> dict[str, Any] | list[str]:
-    r"""Get arguments from the command line or a config file."""
-    if args is not None:
-        return args
-
-    if len(sys.argv) > 1 and (sys.argv[1].endswith(".yaml") or sys.argv[1].endswith(".yml")):
-        override_config = OmegaConf.from_cli(sys.argv[2:])
-        dict_config = OmegaConf.load(Path(sys.argv[1]).absolute())
-        return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config))
-    elif len(sys.argv) > 1 and sys.argv[1].endswith(".json"):
-        override_config = OmegaConf.from_cli(sys.argv[2:])
-        dict_config = OmegaConf.create(json.load(Path(sys.argv[1]).absolute()))
-        return OmegaConf.to_container(OmegaConf.merge(dict_config, override_config))
-    else:
-        return sys.argv[1:]
-
-
 def _get_kt_runtime_capacity(
     data_args: "DataArguments",
     training_args: "TrainingArguments",
@@ -150,6 +127,7 @@ def _parse_args(
     parser: "HfArgumentParser", args: dict[str, Any] | list[str] | None = None, allow_extra_keys: bool = False
 ) -> tuple[Any]:
     args = read_args(args)
+    check_dependencies(use_kt=get_use_kt(args))
     if isinstance(args, dict):
         return parser.parse_dict(args, allow_extra_keys=allow_extra_keys)
 

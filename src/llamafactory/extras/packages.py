@@ -33,11 +33,24 @@ def _is_package_available(name: str) -> bool:
 
 
 def _get_package_version(name: str) -> "Version":
-    distribution = "transformers-kt" if name == "transformers" else name
     try:
-        return version.parse(importlib.metadata.version(distribution))
+        try:
+            package_version = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            if name != "transformers":
+                raise
+            package_version = importlib.metadata.version("transformers-kt")
+        return version.parse(package_version)
     except Exception:
         return version.parse("0.0.0")
+
+
+def is_transformers_kt_available() -> bool:
+    try:
+        importlib.metadata.version("transformers-kt")
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
 
 
 def is_pyav_available():

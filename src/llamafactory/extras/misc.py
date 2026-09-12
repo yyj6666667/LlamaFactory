@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import gc
+import importlib.metadata
 import os
 import socket
 from typing import TYPE_CHECKING, Any, Literal, Optional, Union
@@ -36,6 +37,7 @@ from transformers.utils import (
 from transformers.utils.versions import require_version
 
 from . import logging
+from .packages import is_transformers_kt_available
 
 
 _is_fp16_available = is_torch_npu_available() or is_torch_cuda_available()
@@ -92,13 +94,27 @@ def check_version(requirement: str, mandatory: bool = False) -> None:
     require_version(requirement, hint)
 
 
-def check_dependencies() -> None:
+def check_dependencies(use_kt: bool = False) -> None:
     r"""Check the version of the required packages."""
-    check_version("transformers-kt==5.6.0.post5")
+    if use_kt or is_transformers_kt_available():
+        for name in ("transformers", "accelerate"):
+            try:
+                importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                continue
+            raise ImportError(f"KT requires a separate environment without the upstream `{name}` distribution.")
+        check_version("transformers-kt==5.6.0.post5")
+        check_version("datasets>=2.16.0,<=4.0.0")
+        check_version("accelerate-kt==1.14.0.post3")
+        check_version("peft==0.18.1+kt.20260912")
+        check_version("trl==0.24.0+kt.20260912")
+        return
+
+    check_version("transformers>=4.55.0,<=5.8.0,!=4.57.0,!=5.6.0")
     check_version("datasets>=2.16.0,<=4.0.0")
-    check_version("accelerate-kt==1.14.0.post3")
-    check_version("peft==0.18.1+kt.20260912")
-    check_version("trl==0.24.0+kt.20260912")
+    check_version("accelerate>=1.3.0,<=1.15.0")
+    check_version("peft>=0.18.0,<=0.20.0")
+    check_version("trl>=0.18.0,<=0.24.0")
 
 
 def calculate_tps(dataset: list[dict[str, Any]], metrics: dict[str, float], stage: Literal["sft", "rm"]) -> float:
