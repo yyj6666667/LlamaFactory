@@ -38,6 +38,10 @@ The launcher reads YAML/JSON and CLI overrides before dependency checks and torc
 dispatch. `use_kt: true` selects KT execution; false or omitted preserves the normal
 execution path. CLI `--use_kt`/`--use-kt` uses the existing HF boolean parser. A separate
 `USE_KT` environment variable is not required and does not override the YAML.
+When KT is disabled, a non-null `kt_config` (including one inside `accelerator_config`)
+or an enabled `ACCELERATE_USE_KT` is rejected before training argument initialization.
+Remove these conflicting settings for ordinary training; they cannot silently override
+`use_kt`. No environment variables or user config objects are rewritten.
 
 Version detection checks the installed distribution, not the execution flag. A KT
 installation is checked against its candidate dependencies even for non-KT training;

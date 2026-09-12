@@ -4,6 +4,7 @@
 import ast
 import importlib.metadata
 import importlib.util
+import os
 import sys
 import tomllib
 from pathlib import Path
@@ -173,6 +174,50 @@ def test_invalid_yaml_boolean_fails(arguments, value):
 def test_cli_uses_hf_boolean_semantics(arguments, args, expected):
     pytest.importorskip("transformers")
     assert arguments.get_use_kt(args) is expected
+
+
+@pytest.mark.parametrize("config", [{"kt_config": {}}, {"accelerator_config": {"kt_config": {}}}])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_implicit_kt_config_cannot_override_yaml(arguments, config, enabled):
+    args = config | {"use_kt": enabled}
+    if enabled:
+        assert arguments.get_use_kt(args)
+    else:
+        with pytest.raises(ValueError, match="requires `use_kt: true`"):
+            arguments.get_use_kt(args)
+    assert args == config | {"use_kt": enabled}
+
+
+@pytest.mark.parametrize("flag", ["--kt_config", "--kt-config", "--accelerator_config", "--accelerator-config"])
+def test_implicit_cli_config_is_rejected(arguments, flag):
+    pytest.importorskip("transformers")
+    value = '{"kt_config": {}}' if "accelerator" in flag else "{}"
+    with pytest.raises(ValueError, match="requires `use_kt: true`"):
+        arguments.get_use_kt([flag, value, "--use_kt", "false"])
+
+
+def test_accelerator_config_file_and_ordinary_config(arguments, tmp_path):
+    pytest.importorskip("transformers")
+    path = tmp_path / "accelerator.json"
+    path.write_text('{"kt_config": {}}')
+    with pytest.raises(ValueError, match="accelerator_config.kt_config"):
+        arguments.get_use_kt({"accelerator_config": str(path)})
+    for config in ({"split_batches": False}, '{"split_batches": false}', None):
+        assert arguments.get_use_kt({"accelerator_config": config}) is False
+    path.write_text('{"split_batches": false}')
+    assert arguments.get_use_kt(["--accelerator_config", str(path)]) is False
+
+
+@pytest.mark.parametrize("value", ["true", "1", "yes", "false", "0"])
+def test_accelerate_environment_cannot_silently_enable_kt(arguments, monkeypatch, value):
+    monkeypatch.setenv("ACCELERATE_USE_KT", value)
+    if value in {"true", "1", "yes"}:
+        with pytest.raises(ValueError, match="ACCELERATE_USE_KT"):
+            arguments.get_use_kt({"use_kt": False})
+    else:
+        assert arguments.get_use_kt({"use_kt": False}) is False
+    assert arguments.get_use_kt({"use_kt": True}) is True
+    assert os.environ["ACCELERATE_USE_KT"] == value
 
 
 @pytest.mark.parametrize("enabled", [False, True])
