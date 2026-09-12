@@ -33,8 +33,9 @@ def _is_package_available(name: str) -> bool:
 
 
 def _get_package_version(name: str) -> "Version":
+    distribution = "transformers-kt" if name == "transformers" else name
     try:
-        return version.parse(importlib.metadata.version(name))
+        return version.parse(importlib.metadata.version(distribution))
     except Exception:
         return version.parse("0.0.0")
 

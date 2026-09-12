@@ -94,11 +94,11 @@ def check_version(requirement: str, mandatory: bool = False) -> None:
 
 def check_dependencies() -> None:
     r"""Check the version of the required packages."""
-    check_version("transformers>=4.55.0,<=5.8.0,!=4.57.0,!=5.6.0")
+    check_version("transformers-kt==5.6.0.post5")
     check_version("datasets>=2.16.0,<=4.0.0")
-    check_version("accelerate>=1.3.0,<=1.15.0")
-    check_version("peft>=0.18.0,<=0.20.0")
-    check_version("trl>=0.18.0,<=0.24.0")
+    check_version("accelerate-kt==1.14.0.post3")
+    check_version("peft==0.18.1+kt.20260912")
+    check_version("trl==0.24.0+kt.20260912")
 
 
 def calculate_tps(dataset: list[dict[str, Any]], metrics: dict[str, float], stage: Literal["sft", "rm"]) -> float:
