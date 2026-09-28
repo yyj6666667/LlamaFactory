@@ -103,11 +103,11 @@ def check_dependencies(use_kt: bool = False) -> None:
             except importlib.metadata.PackageNotFoundError:
                 continue
             raise ImportError(f"KT requires a separate environment without the upstream `{name}` distribution.")
-        check_version("transformers-kt==5.6.0.post5")
+        check_version("transformers-kt==5.6.0.post6.dev20260928")
         check_version("datasets>=2.16.0,<=4.0.0")
-        check_version("accelerate-kt==1.14.0.post3")
-        check_version("peft==0.18.1+kt.20260912")
-        check_version("trl==0.24.0+kt.20260912")
+        check_version("accelerate-kt==1.14.0.post4.dev20260928")
+        check_version("peft==0.18.1+kt.20260928")
+        check_version("trl==0.24.0+kt.20260928")
         return
 
     check_version("transformers>=4.55.0,<=5.8.0,!=4.57.0,!=5.6.0")

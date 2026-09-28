@@ -25,11 +25,11 @@ STANDARD_CHECKS = [
     "trl>=0.18.0,<=0.24.0",
 ]
 KT_CHECKS = [
-    "transformers-kt==5.6.0.post5",
+    "transformers-kt==5.6.0.post6.dev20260928",
     "datasets>=2.16.0,<=4.0.0",
-    "accelerate-kt==1.14.0.post3",
-    "peft==0.18.1+kt.20260912",
-    "trl==0.24.0+kt.20260912",
+    "accelerate-kt==1.14.0.post4.dev20260928",
+    "peft==0.18.1+kt.20260928",
+    "trl==0.24.0+kt.20260928",
 ]
 
 
@@ -61,7 +61,7 @@ def test_build_profile_changes_only_selected_metadata(monkeypatch, profile):
         for item in config["dependencies"]
     ]
     assert metadata == {"dependencies": expected}
-    expected_version = "0.9.6.dev0+kt.20260912" if profile == "kt" else "0.9.6.dev0"
+    expected_version = "0.9.6.dev0+kt.20260928" if profile == "kt" else "0.9.6.dev0"
     assert hook_module.get_version() == expected_version
     names = {Requirement(item).name for item in metadata["dependencies"]}
     assert ("transformers-kt" in names) == (profile == "kt")
@@ -111,8 +111,8 @@ def test_version_query_uses_actual_distribution_not_environment(monkeypatch):
     with patch("importlib.metadata.version", return_value="5.8.0") as lookup:
         assert get_version("transformers") == version.parse("5.8.0")
         lookup.assert_called_once_with("transformers")
-    with patch("importlib.metadata.version", side_effect=[importlib.metadata.PackageNotFoundError(), "5.6.0.post5"]):
-        assert get_version("transformers") == version.parse("5.6.0.post5")
+    with patch("importlib.metadata.version", side_effect=[importlib.metadata.PackageNotFoundError(), "5.6.0.post6.dev20260928"]):
+        assert get_version("transformers") == version.parse("5.6.0.post6.dev20260928")
     with patch("importlib.metadata.version", side_effect=importlib.metadata.PackageNotFoundError) as lookup:
         assert get_version("torch") == version.parse("0.0.0")
         lookup.assert_called_once_with("torch")

@@ -481,11 +481,11 @@ class KTransformersArguments:
     )
     kt_weight_path: str | None = field(
         default=None,
-        metadata={"help": "Path to pre-quantized INT8 expert weights (.kt files)."},
+        metadata={"help": "Path to KT expert weights, including native April V4 MXFP4 checkpoints."},
     )
     kt_non_expert_weight_path: str | None = field(
         default=None,
-        metadata={"help": "Path to the KT BF16 non-expert weight cache used with routed INT8 experts."},
+        metadata={"help": "Path to the KT non-expert cache; native April V4 prepares and validates it on first load."},
     )
     kt_expert_checkpoint_path: str | None = field(
         default=None,

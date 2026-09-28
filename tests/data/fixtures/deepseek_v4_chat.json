@@ -1,0 +1,354 @@
+{
+  "model": "deepseek-ai/DeepSeek-V4-Flash",
+  "revision": "0cad8ee349f4f2d669ef30552e3748bd7f8cfab5",
+  "encoder_sha256": "bdbd57c132a1b3725042323d02b98b9d1df28e5f388f134399555d041f5055e0",
+  "tokenizer_sha256": "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
+  "cases": [
+    {
+      "system": null,
+      "messages": [
+        {
+          "role": "user",
+          "content": "你好"
+        },
+        {
+          "role": "assistant",
+          "content": "你好。"
+        }
+      ],
+      "rendered": "<｜begin▁of▁sentence｜><｜User｜>你好<｜Assistant｜></think>你好。<｜end▁of▁sentence｜>",
+      "input_ids": [
+        0,
+        128803,
+        30594,
+        128804,
+        128822,
+        30594,
+        320,
+        1
+      ],
+      "labels": [
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        30594,
+        320,
+        1
+      ]
+    },
+    {
+      "system": "请简短回答。",
+      "messages": [
+        {
+          "role": "user",
+          "content": "1+1？"
+        },
+        {
+          "role": "assistant",
+          "content": "2"
+        },
+        {
+          "role": "user",
+          "content": "再加一呢？"
+        },
+        {
+          "role": "assistant",
+          "content": "3"
+        }
+      ],
+      "rendered": "<｜begin▁of▁sentence｜>请简短回答。<｜User｜>1+1？<｜Assistant｜></think>2<｜end▁of▁sentence｜><｜User｜>再加一呢？<｜Assistant｜></think>3<｜end▁of▁sentence｜>",
+      "input_ids": [
+        0,
+        2788,
+        102475,
+        9090,
+        320,
+        128803,
+        19,
+        13,
+        19,
+        1148,
+        128804,
+        128822,
+        20,
+        1,
+        128803,
+        68147,
+        378,
+        3159,
+        1148,
+        128804,
+        128822,
+        21,
+        1
+      ],
+      "labels": [
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        20,
+        1,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        21,
+        1
+      ]
+    },
+    {
+      "system": "Answer in English.",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Name a primary color."
+        },
+        {
+          "role": "assistant",
+          "content": "Red."
+        },
+        {
+          "role": "user",
+          "content": "Name another."
+        },
+        {
+          "role": "assistant",
+          "content": "Blue."
+        }
+      ],
+      "rendered": "<｜begin▁of▁sentence｜>Answer in English.<｜User｜>Name a primary color.<｜Assistant｜></think>Red.<｜end▁of▁sentence｜><｜User｜>Name another.<｜Assistant｜></think>Blue.<｜end▁of▁sentence｜>",
+      "input_ids": [
+        0,
+        7805,
+        295,
+        3947,
+        16,
+        128803,
+        3240,
+        260,
+        6074,
+        3605,
+        16,
+        128804,
+        128822,
+        14238,
+        16,
+        1,
+        128803,
+        3240,
+        2658,
+        16,
+        128804,
+        128822,
+        29689,
+        16,
+        1
+      ],
+      "labels": [
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        14238,
+        16,
+        1,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        29689,
+        16,
+        1
+      ]
+    },
+    {
+      "system": "保留原格式。",
+      "messages": [
+        {
+          "role": "user",
+          "content": "甲\n乙"
+        },
+        {
+          "role": "assistant",
+          "content": "甲\n乙"
+        },
+        {
+          "role": "user",
+          "content": "  空格  "
+        },
+        {
+          "role": "assistant",
+          "content": "  已保留  "
+        }
+      ],
+      "rendered": "<｜begin▁of▁sentence｜>保留原格式。<｜User｜>甲\n乙<｜Assistant｜></think>甲\n乙<｜end▁of▁sentence｜><｜User｜>  空格  <｜Assistant｜></think>  已保留  <｜end▁of▁sentence｜>",
+      "input_ids": [
+        0,
+        18901,
+        1532,
+        16734,
+        320,
+        128803,
+        5492,
+        201,
+        8875,
+        128804,
+        128822,
+        5492,
+        201,
+        8875,
+        1,
+        128803,
+        262,
+        70399,
+        262,
+        128804,
+        128822,
+        262,
+        1481,
+        18901,
+        262,
+        1
+      ],
+      "labels": [
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        5492,
+        201,
+        8875,
+        1,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        262,
+        1481,
+        18901,
+        262,
+        1
+      ]
+    },
+    {
+      "system": null,
+      "messages": [
+        {
+          "role": "user",
+          "content": "输出空字符串。"
+        },
+        {
+          "role": "assistant",
+          "content": ""
+        }
+      ],
+      "rendered": "<｜begin▁of▁sentence｜><｜User｜>输出空字符串。<｜Assistant｜></think><｜end▁of▁sentence｜>",
+      "input_ids": [
+        0,
+        128803,
+        10626,
+        2084,
+        23884,
+        320,
+        128804,
+        128822,
+        1
+      ],
+      "labels": [
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        1
+      ]
+    },
+    {
+      "system": "",
+      "messages": [
+        {
+          "role": "user",
+          "content": "解释 </think> 这个标记。"
+        },
+        {
+          "role": "assistant",
+          "content": "这是一个边界标记。"
+        }
+      ],
+      "rendered": "<｜begin▁of▁sentence｜><｜User｜>解释 </think> 这个标记。<｜Assistant｜></think>这是一个边界标记。<｜end▁of▁sentence｜>",
+      "input_ids": [
+        0,
+        128803,
+        9068,
+        223,
+        128822,
+        223,
+        1959,
+        28879,
+        320,
+        128804,
+        128822,
+        28669,
+        30140,
+        28879,
+        320,
+        1
+      ],
+      "labels": [
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        -100,
+        28669,
+        30140,
+        28879,
+        320,
+        1
+      ]
+    }
+  ]
+}

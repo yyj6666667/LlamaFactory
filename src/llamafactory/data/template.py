@@ -454,6 +454,17 @@ class Llama2Template(Template):
 
 
 @dataclass
+class DeepseekV4ChatTemplate(Template):
+    """April V4 ordinary conversations; tool/thinking formats need separate support."""
+
+    @override
+    def _encode(self, tokenizer, messages, system, tools):
+        if tools or any(message["role"] not in (Role.USER, Role.ASSISTANT) for message in messages):
+            raise ValueError("deepseek4_nothink supports ordinary user/assistant conversations without tools.")
+        return super()._encode(tokenizer, messages, system, tools)
+
+
+@dataclass
 class ReasoningTemplate(Template):
     r"""A template that add thought to assistant message."""
 
@@ -954,6 +965,20 @@ register_template(
     name="deepseek3",
     format_user=StringFormatter(slots=["<｜User｜>{{content}}<｜Assistant｜>"]),
     format_prefix=EmptyFormatter(slots=[{"bos_token"}]),
+)
+
+
+# April V4 chat mode puts </think> in the prompt, before the supervised answer.
+# Keep the training formatter and the exported tokenizer template consistent.
+register_template(
+    name="deepseek4_nothink",
+    format_user=StringFormatter(slots=["<｜User｜>{{content}}<｜Assistant｜></think>"]),
+    format_prefix=EmptyFormatter(slots=[{"bos_token"}]),
+    stop_words=["<｜end▁of▁sentence｜>"],
+    replace_eos=True,
+    replace_jinja_template=True,
+    enable_thinking=False,
+    template_class=DeepseekV4ChatTemplate,
 )
 
 

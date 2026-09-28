@@ -78,10 +78,10 @@ dependencies = [
 ]
 
 [tool.hatch.metadata.hooks.custom.kt-dependencies]
-transformers = "transformers-kt==5.6.0.post5"
-accelerate = "accelerate-kt==1.14.0.post3"
-peft = "peft==0.18.1+kt.20260912"
-trl = "trl==0.24.0+kt.20260912"
+transformers = "transformers-kt==5.6.0.post6.dev20260928"
+accelerate = "accelerate-kt==1.14.0.post4.dev20260928"
+peft = "peft==0.18.1+kt.20260928"
+trl = "trl==0.24.0+kt.20260928"
 
 [project.scripts]
 llamafactory-cli = "llamafactory.cli:main"

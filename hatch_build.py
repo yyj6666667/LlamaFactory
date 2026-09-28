@@ -25,7 +25,7 @@ def get_version():
         for node in tree.body
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "VERSION" for t in node.targets)
     )
-    return f"{version}+kt.20260912" if get_profile() == "kt" else version
+    return f"{version}+kt.20260928" if get_profile() == "kt" else version
 
 
 class CustomMetadataHook(MetadataHookInterface):

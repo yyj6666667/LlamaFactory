@@ -46,6 +46,14 @@ def run_sft(
     generating_args: "GeneratingArguments",
     callbacks: Optional[list["TrainerCallback"]] = None,
 ):
+    if model_args.use_kt:
+        from ...model.loader import load_config
+        from ...model.model_utils.deepseek_v4 import validate_kt_deepseek_v4_training
+
+        validate_kt_deepseek_v4_training(
+            load_config(model_args), model_args, data_args, training_args, finetuning_args
+        )
+
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
